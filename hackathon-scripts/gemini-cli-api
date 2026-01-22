@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# Define the Gemini API endpoint and your API key
+gemini_endpoint="https://api.gemini.com/v1/status"  # Replace with the correct status endpoint if available
+gemini_key="key goes here"
+
+# Perform a test request
+response=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $gemini_key" $gemini_endpoint)
+
+# Check the HTTP response code
+if [ "$response" -eq 200 ]; then
+    echo "Gemini service is up"
+else
+    echo "Gemini service is down or unreachable (HTTP status: $response)"
+fi
