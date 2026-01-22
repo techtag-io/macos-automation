@@ -1,0 +1,252 @@
+#!/bin/bash
+
+universal_parameters(){
+	#APIs
+	caltrain_api_key="1a4e65dc-fd7b-44c0-a2b1-488ed804e59c"
+	gemini_key="AIzaSyAornUrFLPgMM26YEKKAMzOUKA5igEosHo"
+	BART_API_KEY="ZAXL-PQDK-996T-DWEI"
+	
+	#setting limits
+	caltrain_api_countdown=3
+	
+	#dialog
+    updatedDialogVersion=2.5.3
+	dialog_bin="/usr/local/bin/dialog"
+	dialog_download_url="https://github.com/swiftDialog/swiftDialog/releases/download/v2.5.3/dialog-2.5.3-4785.pkg"
+	dialogDir='/usr/local/'
+	swiftDialogPKG="swiftDialog.pkg"
+	dialogAppDir="/Library/Application Support/Dialog/Dialog.app"
+    
+    wallpaperDir="/Library/Application Support/wallpaper/"
+    wallpaperImg="desktopwallpaper.jpg"
+    wallpaperPKGDir="/Library/Application Support/Jamf/Waiting Room/wallpaper.pkg"
+	
+	dialogIconDir="/Library/Application Support/SideIT/finishing.png"
+	dialogBackGroundDir="/Library/Application Support/wallpaper/desktopwallpaper.jpg"
+	dialogSlackURL="https://app.slack.com/client/T0XD2CN2V/CNW9PA7NG"
+	dialogHDURL="https://sideinc.freshservice.com/support/catalog/items/131"
+	dialogTitleFont="name=Arial-MT,colour=#CE87C1,size=30"
+
+}
+
+install_dialog () {
+    
+    if [ -f "$wallpaperDir$wallpaperImg" ]; then
+    echo "Wallpaper found, skipping install"
+    else
+    echo "Installing wallpaper"
+    sudo /usr/sbin/installer -pkg "$wallpaperPKGDir" -target /
+    fi
+    
+	
+	#Check Dialog version
+	if [ -f $dialog_bin ]; then
+		echo "Dialog app found, checking version"
+        dialogVersion=$(defaults read /Library/Application\ Support/Dialog/Dialog.app/Contents/Info CFBundleShortVersionString)
+		echo "Dialog Version: "$dialogVersion
+
+		if [ $dialogVersion != $updatedDialogVersion ]; then
+			#if not equal, then update
+			echo "Dialog not up to date, updating..."
+   		    echo "Dialog app not found, downloading and installing dialog"
+	  	    ##Download swiftDialog
+	  	    sudo /usr/bin/curl -L "$dialog_download_url" -o "$dialogDir$swiftDialogPKG"
+	
+	    	##Installing Dialog
+	       sudo /usr/sbin/installer -pkg "$dialogDir$swiftDialogPKG" -target /
+		    sleep 5
+	
+		    #Cleanup
+		    sudo rm -r "$dialogDir$swiftDialogPKG"
+
+        else
+	        #if equal, do not update
+	        echo "Dialog Version Correct, skipping update"
+        fi
+        
+        
+        
+	else 
+		echo "Dialog app not found, downloading and installing dialog"
+	    ##Download swiftDialog
+	    sudo /usr/bin/curl -L "$dialog_download_url" -o "$dialogDir$swiftDialogPKG"
+	
+	    ##Installing Dialog
+	    sudo /usr/sbin/installer -pkg "$dialogDir$swiftDialogPKG" -target /
+		sleep 5
+	
+		#Cleanup
+		sudo rm -r "$dialogDir$swiftDialogPKG"
+	fi
+	
+
+}
+
+
+
+
+
+#====================================
+# Regular Alert
+caltrain_status () {
+	
+	
+	echo "caltrain_api_countdown: "$caltrain_api_countdown
+
+	# Deduct 1 from the countdown
+	let caltrain_api_countdown=$caltrain_api_countdown-1
+
+	  # When countdown reaches 0, run the special command and reset the countdown
+	  if (($caltrain_api_countdown == 0)); then
+	    echo "Getting CalTrain data $i"
+	   
+	   
+		# Ensure the API key is not empty
+		if [ -z "$caltrain_api_key" ]; then
+		    echo "API key is missing!"
+		    exit 1
+		fi
+
+		# Define the API endpoint
+		#url="http://api.511.org/transit/servicealerts?api_key=$caltrain_api_key&agency=CT"
+
+		# Debugging: Print the API key and URL
+		echo "Requesting URL: $url"
+
+		# Use curl to make the request and capture the response
+		response=$(curl -s "$url")
+
+		#echo "Response"
+		#echo $response
+
+		echo "$response" | pbcopy
+
+		echo "pasting: $(pbpaste)"
+
+		cleaned_up_text=$(gemini-cli prompt "Please clean up the following text and organize it into a bullet point list with each item separated by new lines, removing any extraneous information and only leave the list items in english. Make sure the items are separeted in new lines in bullet point order and all non-english is removed. Remove anything with local week day. Here’s the text: $(pbpaste)" --key $gemini_key)
+	   
+	    caltrain_api_countdown=3 # Reset the countdown
+		caltrain_api_pull_time=$(date +"%m-%d-%Y %H:%M:%S")
+	  fi
+
+	
+	
+	
+	
+	
+	echo "Cleaned text"
+	echo "$cleaned_up_text"
+
+
+	if [ -n "$cleaned_up_text" ]; then
+		#yes text
+		msg_font="name=Arial-MT,size=18,colour=#FF0000"
+	else
+		#no text
+		msg_font="name=Arial-MT,size=18"
+	fi
+
+
+	
+}
+
+caltrain_page () {
+caltrain_status
+
+if [[ $caltrain_api_countdown -eq 0 ]]; then
+  api_label="running now"
+else
+  api_label="$caltrain_api_countdown left"
+fi
+
+
+sleep 2
+
+dTitle="Caltrain - Live Transit Times From San Francisco"
+dMessage="Next live status update in: $api_label. Last live update: $caltrain_api_pull_time \n\n
+Caltrain - Any delays will be posted here:\n
+**$cleaned_up_text** \n\n
+\n\n
+
+
+San Francisco Schedule"
+
+
+timer=10 # 60 seconds * 10 min = 600
+dIconDir="$dialogIconDir"
+dBackDir="$dialogBackGroundDir"
+dInfoBox="__Welcome to Side!__\n\n
+__580 4th St, San Francisco, CA__
+\n\n
+(415) 525-4913
+\n\n
+__Need Help?__  
+helpdesk@side.com"
+
+userTimeSelection=$(${dialog_bin} \
+    --title "$dTitle" \
+	--titlefont "$dialogTitleFont" \
+	--message "$dMessage" \
+	--messagefont "$msg_font" \
+    --icon "$dIconDir" \
+	--iconsize 120 \
+    --button1text "$dButton1" \
+	--height 100% \
+	--width 100% \
+	--background "$dBackDir" \
+	--infobox "$dInfoBox" \
+    --timer "$timer" \
+	--webcontent "https://www.caltrain.com/station/sanfrancisco" 
+    #--blurscreen
+    #--button2text "$dButton2" \
+
+)
+
+
+}
+
+
+###### Regular Alert DONE
+universal_parameters
+
+install_dialog
+
+caltrain_page
+
+sleep 2
+
+caltrain_page
+
+sleep 2
+
+caltrain_page
+
+sleep 2
+
+caltrain_page
+
+sleep 2
+
+caltrain_page
+
+sleep 2
+
+caltrain_page
+
+sleep 2
+
+caltrain_page
+
+sleep 2
+
+caltrain_page
+
+sleep 2
+
+caltrain_page
+
+sleep 2
+
+caltrain_page
+
+sleep 2
