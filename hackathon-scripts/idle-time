@@ -1,0 +1,126 @@
+#as soon as the mouse or keyboard makes an input, timer resets
+
+#!/bin/bash
+
+#parameters
+#dialog
+dialogIconDir="/Library/Application Support/SideIT/ATTIcon.png"
+dialogBackGroundDir="/Library/Application Support/wallpaper/desktopwallpaper.jpg"
+dialogSlackURL="https://app.slack.com/client/T0XD2CN2V/CNW9PA7NG"
+dialogHDURL="https://sideinc.freshservice.com/support/catalog/items/131"
+dialogTitleFont="name=Arial-MT,colour=#CE87C1,size=30"
+dialog_bin="/usr/local/bin/dialog"
+macSerial=$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')
+
+
+startToIdle () {
+
+idleTime=$(ioreg -c IOHIDSystem | awk '/HIDIdleTime/ {print $NF/1000000000; exit}')
+echo $idleTime
+let timeToLock=5*60
+timeToLock=10
+
+
+
+until [ $idleTime == $timeToLock ];
+do
+	
+	#Get idle time
+	idleTime=$(ioreg -c IOHIDSystem | awk '/HIDIdleTime/ {print $NF/1000000000; exit}')
+	#echo "Time Pass1: "$idleTime
+	
+	#convert float into int string (1.000000 into 1)
+	idleTime="${idleTime%%.*}"
+	
+	#convert string into int
+	idleTime=$(echo "$idleTime" | sed 's/[^0-9]//g')
+	
+	
+	echo "Time Pass2: "$idleTime
+	#sleep for 1 second so that every check is 1 second
+	sleep 1
+
+	#After 5 mintues - be done
+done
+
+echo "5 Minutes no activity, launching lock alert"
+launchLock
+
+}
+
+
+
+
+launchLock () {
+	
+dTitle="Side, Inc Print Station"
+dMessage="Greetings! 
+
+This print station is available for anyone to use. If you need to print something, you will be able to do so from this computer.
+	
+ATTENTION:
+By clicking \"I Agree\", you agree that you are using this device at your own risk.
+This device is not monitored but it is an unsecure station used by anyone who needs it.
+	
+Upon clicking \"I Agree\", all data on the hard drive is automatically deleted and Google Chrome is reset so that all logins are logged out.
+	
+After 5 minutes of inactivity, the computer will auto-lock.
+
+Contact helpdesk@side.com or #it-support in Slack with any questions.
+Thank you! \n
+Side IT Helpdesk"
+dIconDir="$dialogIconDir"
+dButton="I Agree"
+dInfoBox="__Side IT Helpdesk__\n\n
+__Print Station__\n\n
+__Device Serial__
+$macSerial\n\n
+__Email__  
+[helpdesk@side.com]($dialogHDURL)"
+
+
+			updateNowAlert=$(${dialog_bin} \
+			    --title "$dTitle" \
+				--titlefont "$dialogTitleFont" \
+			    --message "$dMessage" \
+				--messagefont "name=Arial-MT,size=30" \
+			    --icon "$dIconDir" \
+				--iconsize 250 \
+				--helpmessage "$dHelp" \
+				--big \
+			    --infobox "$dInfoBox" \
+				--button1text "$dButton" \
+				--background "$dialogBackGroundDir" \
+				--blurscreen
+	
+			)
+				
+				
+				
+				#Button pressed Stuff
+				returncode=$?
+
+
+				case ${returncode} in
+				    0)  echo "Pressed Button 1: I Agree"
+					#code to download
+					startToIdle
+					#code to delete all, etc
+		
+		
+					exit 0
+				        ;;
+
+		
+				    *)  echo "Something else happened. exit code ${returncode}"
+					exit 0
+
+				        ;;
+				esac
+	
+
+}
+
+
+
+launchLock
