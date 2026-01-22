@@ -1,0 +1,355 @@
+#!/bin/bash
+
+checkDiskSpace () {
+
+	DISK_SIZE_FREE=$(df -kh . | tail -n1 | awk '{print $4}')
+	DISK_SIZE_FREE_INT="${DISK_SIZE_FREE//Gi}"
+	DISK_SIZE_FREE_INT=$(echo "$DISK_SIZE_FREE_INT" | sed 's/[^0-9]//g')
+
+	echo "DISK_SIZE_FREE: "$DISK_SIZE_FREE
+	echo "DISK_SIZE_FREE_INT: "$DISK_SIZE_FREE_INT
+	
+
+
+	#if SSD has less than 40GB of free space, do not proceed
+	if [[ "$DISK_SIZE_FREE_INT" -le 40 ]]; then
+		
+		echo "not enough room"
+		diskSpace="_**ATTENTION: You only have $DISK_SIZE_FREE_INT GB free disk space and need at least 40 GB to perform this update.**_
+		\n_**If you need assistance with clearing up some disk space, please reach out to helpdesk@side.com**_"
+	else
+		echo "Plenty of space, running installer"
+		diskSpace=""
+	fi
+
+}
+
+launchAlert () {
+    updatedDialogVersion=2.3.2
+	dialog_bin="/usr/local/bin/dialog"
+    wallpaperDir="/Library/Application Support/wallpaper/"
+    wallpaperImg="desktopwallpaper.jpg"
+    wallpaperPKGDir="/Library/Application Support/Jamf/Waiting Room/wallpaper.pkg"
+	
+	
+	currentOSVersion=$(sw_vers -productVersion)
+	macSerial=$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')
+	
+	
+dTitle="Side IT Alert: Critical macOS Update Available - 13.6"
+dMessage="You are getting this alert because this device needs to be updated to _**macOS 13.6**_ 
+\nDue to this being a _**Critical Zero-Day macOS Update**_, you have until Sunday, September 24th, to get the update complete.
+
+_**These alerts will launch every 30-45 minutes and can only be stopped by updating to macOS 13.6**_
+
+$dlReady
+
+Please make sure all your important data is in Google Drive before proceeding!!\n\n
+Contact helpdesk@side.com or #it-support in Slack with any questions.\n
+Thank you!\n 
+-Side IT.
+
+$diskSpace"
+dButton1="Update Now"
+dButton2="Later"
+timer=600 #60 seconds * 10 min = 600
+dIconDir="$dialogIconDir"
+dBackDir="$dialogBackGroundDir"
+dHelp="This notification is launched automatically by Side IT Helpdesk.\n
+Please contact helpdesk@side.com or #it-support in Slack with any questions or concerns."
+dInfoBox="__Current macOS:__ $currentOSVersion\n\n
+__Update To:__
+13.6\n\n
+__Device Serial__
+$macSerial\n\n
+__Slack__  
+[#it-support]($dialogSlackURL)\n\n
+__Support Ticket__  
+[helpdesk@side.com]($dialogHDURL)"
+
+
+		updateSelect=$(${dialog_bin} \
+		    --title "$dTitle" \
+			--titlefont "$dialogTitleFont" \
+		    --message "$dMessage" \
+			--messagefont "name=Arial-MT,size=16" \
+		    --icon "$dIconDir" \
+			--iconsize 120 \
+		    --button1text "$dButton1" \
+			--helpmessage "$dHelp" \
+			--height 50% \
+			--width 50% \
+			--background "$dBackDir" \
+			--infobox "$dInfoBox" \
+	        --timer "$timer" \
+	        --button2text "$dButton2" 
+	
+		)		
+	
+	
+		
+
+
+		#Button pressed Stuff
+		returncode=$?
+
+
+		case ${returncode} in
+		    0)  echo "Pressed Button 1: update"
+			sudo open "/Applications/Install macOS Ventura.app"
+
+		
+	
+		        ;;
+
+		    2)  echo "Pressed Button 2: Postpone"
+	
+		
+
+		        ;;
+		
+		    *)  echo "Error: No Button Pressed. Launcing Alert and dismissing. exit code ${returncode}"
+		
+		
+        
+
+		        ;;
+		esac
+	
+
+}
+
+installSwiftDialog () {
+	
+    updatedDialogVersion=2.3.2
+	dialog_bin="/usr/local/bin/dialog"
+	#dialog_download_url="https://github.com/bartreardon/swiftDialog/releases/download/v2.2.1/dialog-2.2.1-4591.pkg"
+	dialog_download_url="https://github.com/swiftDialog/swiftDialog/releases/download/v2.3.2/dialog-2.3.2-4726.pkg"
+	dialogDir='/usr/local/'
+	swiftDialogPKG="swiftDialog.pkg"
+	dialogAppDir="/Library/Application Support/Dialog/Dialog.app"
+    
+    wallpaperDir="/Library/Application Support/wallpaper/"
+    wallpaperImg="desktopwallpaper.jpg"
+    wallpaperPKGDir="/Library/Application Support/Jamf/Waiting Room/wallpaper.pkg"
+	
+	dialogIconDir="/Library/Application Support/SideIT/ATTIcon.png"
+	dialogBackGroundDir="/Library/Application Support/wallpaper/desktopwallpaper.jpg"
+	dialogSlackURL="https://app.slack.com/client/T0XD2CN2V/CNW9PA7NG"
+	dialogHDURL="https://sideinc.freshservice.com/support/catalog/items/131"
+	dialogTitleFont="name=Arial-MT,colour=#CE87C1,size=30"
+    
+    if [ -f "$wallpaperDir$wallpaperImg" ]; then
+    echo "Wallpaper found, skipping install"
+    else
+    echo "Installing wallpaper"
+    sudo /usr/sbin/installer -pkg "$wallpaperPKGDir" -target /
+    fi
+    
+
+	if [ -f $dialog_bin ]; then
+		echo "Dialog app found, checking version"
+        dialogVersion=$(defaults read /Library/Application\ Support/Dialog/Dialog.app/Contents/Info CFBundleShortVersionString)
+		echo "Dialog Version: "$dialogVersion
+
+		if [ $dialogVersion != $updatedDialogVersion ]; then
+			#if not equal, then update
+			echo "Dialog not up to date, updating..."
+   		    echo "Dialog app not found, downloading and installing dialog"
+	  	    ##Download swiftDialog
+	  	    sudo /usr/bin/curl -L "$dialog_download_url" -o "$dialogDir$swiftDialogPKG"
+	
+	    	##Installing Dialog
+	       sudo /usr/sbin/installer -pkg "$dialogDir$swiftDialogPKG" -target /
+		    sleep 5
+	
+		    #Cleanup
+		    sudo rm -r "$dialogDir$swiftDialogPKG"
+
+        else
+	        #if equal, do not update
+	        echo "Dialog Version Correct, skipping update"
+        fi
+        
+        
+        
+	else 
+		echo "Dialog app not found, downloading and installing dialog"
+	    ##Download swiftDialog
+	    sudo /usr/bin/curl -L "$dialog_download_url" -o "$dialogDir$swiftDialogPKG"
+	
+	    ##Installing Dialog
+	    sudo /usr/sbin/installer -pkg "$dialogDir$swiftDialogPKG" -target /
+		sleep 5
+	
+		#Cleanup
+		sudo rm -r "$dialogDir$swiftDialogPKG"
+	fi
+echo "Checking disk space and launching alert..."
+checkDiskSpace
+launchAlert	
+
+}
+
+checkmacOSVersion () {
+
+macOSVersion=13.6
+##Device info
+osversion=$(sw_vers -productVersion)
+macSerial=$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')
+
+
+echo "Checking for 13.6"
+echo "Version: "$osversion
+
+if [ "$osversion" == "$macOSVersion" ]; then
+	echo "macOS is up to date with $osversion, running recon and exiting..."
+    sudo jamf recon
+	exit 0
+else
+	echo "macOS $osversion NOT on $macOSVersion, proceeding with installer check."
+fi
+
+
+
+
+echo "Checking for 13.6"
+
+if [ -a "/Applications/Install macOS Ventura.app" ]; then
+	echo "Installer found, checking version..."
+    installer_version=$(defaults read "/Applications/Install macOS Ventura.app/Contents/info.plist" DTPlatformVersion)
+	echo "Version found: "$installer_version
+	
+	if [ "$installer_version" != "13.6" ]; then
+		echo "Incorrect version, deleting and downloading 13.6"
+		sudo rm -rf "/Applications/Install macOS Ventura.app"
+	else
+		echo "Correct version, skipping download and launching alert"
+	fi
+else
+	echo "Installer not found, downloading 13.6"
+	#macOS InstallAssistant PKG - this will contain and exract Install macOS Ventura.app
+	#macOSURL - 13.6 - updated 09.21.2023
+	macOSURL='https://swcdn.apple.com/content/downloads/28/01/042-55926-A_7GZJNO2M4I/asqcyheggme9rflzb3z3pr6vbp0gxyk2eh/InstallAssistant.pkg'
+	macOSDir="/usr/local/"
+	macOSPKG="InstallAssistant.pkg"
+	
+	#downloading InstallAssistant.pkg for Ventura
+	curl -L "$macOSURL" -o "$macOSDir$macOSPKG"
+	#install - extract "Install macOS Ventura.app"
+	/usr/sbin/installer -pkg "$macOSDir$macOSPKG" -target /
+	sleep 5
+	#Cleanup - remove InstallAssistant.pkg
+	sudo rm -rf "$macOSDir$macOSPKG"
+fi
+
+echo "Checking installer after download"
+if [ -a "/Applications/Install macOS Ventura.app" ]; then
+	echo "Installer found, checking version..."
+    installer_version=$(defaults read "/Applications/Install macOS Ventura.app/Contents/info.plist" DTPlatformVersion)
+echo "Version pulled: "$installer_version
+
+	if [ "$installer_version" != "13.6" ]; then
+	echo "wrong version, running recon and exiting"
+	dlReady=" "
+	installSwiftDialog
+    else
+    echo "Installer found with correct version, checking time"
+	dlReady="For your convenience, you have the \"Install macOS Ventura\" application in the /Applications folder ready to be installed. Just click \"Update Now\" to launch the installer."
+    installSwiftDialog
+    fi
+else
+	echo "Installer failed, setting message and launching alert"
+dlReady=" "
+installSwiftDialog
+fi
+}
+
+checkTimers () {
+	### Checking for check in file
+	checkinCountFile='/tmp/checkinCounter.txt'
+	
+	  #checkinCountFile='/usr/local/checkinCount.txt'
+	  
+	  
+	  if [ -f "$checkinCountFile" ]; then
+		  echo "Checkin file found, extracting data"
+		  
+		  echo "Pulling checkin count data..."
+		  checkinCountPull=$( tail -n 1 $checkinCountFile)
+		  echo $checkinCountPull pulled from file
+		  
+		  
+		  if [[ "$checkinCountPull" < 2 ]]; then
+			  echo "Checkin less than 2 since alert launch, counting up and exiting..."
+			  echo "Adding 1 to checkin count"
+			  checkinCountPull=$(echo "$checkinCountPull" | sed 's/[^0-9]//g')
+			  echo "checkinCountPull after convert: "$checkinCountPull
+			  let checkinCountPull=$checkinCountPull+1
+			  echo "Remaining checkins: "$checkinCountPull
+			  
+			  echo "Removing checkinCountFile"
+			  sudo rm -rf $checkinCountFile
+			  
+			  echo "Creating new checkinCountFile with updated checkin count"
+			  echo $checkinCountPull >> $checkinCountFile
+			  
+			  echo "Exiting Script..."
+			  
+		  else
+			  echo "Checkin is 2, checking postpone amounts"
+			  
+			  
+			  echo "Resetting checkin..."
+			  let checkinCountPull=1
+			  
+			  echo "Removing checkinCountFile"
+			  sudo rm -rf $checkinCountFile
+			  
+			  echo "Creating new checkinCountFile with updated checkin count"
+			  echo $checkinCountPull >> $checkinCountFile
+			  
+			   echo "Launching alert..."
+			  checkmacOSVersion
+			  
+		   fi
+		   
+		   
+	   else
+		    
+		  echo "Fresh push, launching primary alert"
+		  let checkinCountPull=1
+		  echo "Total Checkins: "$checkinCountPull
+	  
+		  echo "Removing checkinCountFile"
+		  sudo rm -rf $checkinCountFile
+	  
+		  echo "Creating new checkinCountFile with updated checkin count"
+		  echo $checkinCountPull >> $checkinCountFile
+		  
+		  echo "Launching alert..."
+		  checkmacOSVersion
+	      fi
+	  			
+
+}
+
+##Starting
+###CHECK macOS Version
+macOSVersion=13.6
+##Device info
+osversion=$(sw_vers -productVersion)
+macSerial=$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')
+
+
+echo "Checking for 13.6"
+echo "Version: "$osversion
+
+if [ "$osversion" == "$macOSVersion" ]; then
+	echo "macOS is up to date with $osversion, running recon and exiting..."
+    sudo jamf recon
+	exit 0
+else
+	echo "macOS $osversion NOT on $macOSVersion, proceeding with installer check."
+	checkTimers
+fi
