@@ -1,0 +1,83 @@
+#!/bin/bash
+
+#Latest Chrome Version
+latestChromeV=$(curl -s "https://omahaproxy.appspot.com/history" | awk -F',' '/mac,stable/{print $3; exit}')
+echo "Latest Chrome Version: "$latestChromeV
+
+#check Current Installed Chrome Version
+installedChromeV=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" /Applications/Google\ Chrome.app/Contents/Info.plist)
+echo "Installed Chrome Version: "$installedChromeV
+echo ""
+echo ""
+
+if [ "$installedChromeV" = "$latestChromeV" ]; then
+	echo "Chrome up to date! Running Recon then exiting..."
+    #update Jamf first
+	sudo jamf recon
+    exit 0
+else
+	echo "Not up to date, updating..."
+fi
+
+#identify M1 vs Intel to target URL
+if [[ `uname -m` == 'arm64' ]]; then
+  echo "Sicilone: M1"
+  siliconType="M1"
+  url='https://dl.google.com/chrome/mac/universal/stable/CHFA/googlechrome.dmg '
+else
+echo "Silicone: Intel"
+siliconType="intel"
+#url="https://dl.google.com/chrome/mac/stable/GGRO/googlechrome.dmg" 
+#same URL as M1
+echo "replaced URL"
+url='https://dl.google.com/chrome/mac/universal/stable/CHFA/googlechrome.dmg '
+fi
+
+dmgfile="googlechrome.dmg"
+volname="Google Chrome"
+logfile="/Library/Logs/GoogleChromeInstallScript.log"
+
+echo "DMG: "$dmgfile
+echo "VolName: "$volname
+
+
+
+/bin/echo "--" >> ${logfile}
+/bin/echo "`date`: Downloading latest version." >> ${logfile}
+echo "Downloading latest version."
+
+
+/usr/bin/curl -s -o /tmp/${dmgfile} ${url}
+/bin/echo "`date`: Mounting installer disk image." >> ${logfile}
+echo "Mounting installer disk image."
+
+
+/usr/bin/hdiutil attach /tmp/${dmgfile} -nobrowse -quiet
+/bin/echo "`date`: Installing..." >> ${logfile}
+echo "Installing..."
+
+
+ditto -rsrc "/Volumes/${volname}/Google Chrome.app" "/Applications/Google Chrome.app"
+/bin/sleep 10
+/bin/echo "`date`: Unmounting installer disk image." >> ${logfile}
+echo "Unmounting installer disk image."
+
+/usr/bin/hdiutil detach $(/bin/df | /usr/bin/grep "${volname}" | awk '{print $1}') -quiet
+/bin/sleep 10
+/bin/echo "`date`: Deleting disk image." >> ${logfile}
+echo "Deleting disk image."
+
+
+/bin/rm /tmp/"${dmgfile}"
+
+#run recon to update jamf
+echo "running recon"
+sudo jamf recon
+
+echo ""
+echo ""
+installedChromeV=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" /Applications/Google\ Chrome.app/Contents/Info.plist)
+echo "Installed Chrome Version: "$installedChromeV
+
+#trigger zero day alert - if this policy is off, the alert will NOT trigger
+sudo jamf policy -event chromeUpdateAlertZeroDay
