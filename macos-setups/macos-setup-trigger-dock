@@ -1,0 +1,14 @@
+#!/bin/sh
+
+# wait until the Dock process has started
+while [[ "$setupProcess" = "" ]]
+do
+	echo "Waiting for Dock"
+	setupProcess=$( /usr/bin/pgrep "Dock" )
+	sleep 3
+done
+
+sleep 3
+
+#trigger policy
+sudo jamf policy -event jamfHelperSetup
