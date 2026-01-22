@@ -1,0 +1,51 @@
+#!/bin/sh
+
+# wait until the Self Service process has started
+while [[ "$setupProcess" = "" ]]
+do
+	echo "Waiting for Self Service..."
+	setupProcess=$( /usr/bin/pgrep "Self Service" )
+	sleep 3
+done
+
+
+#intialiaizng
+/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType fs -icon /Library/Application\ Support/SideIT/initiatingSetup.png -fullScreenIcon & sleep 5
+
+
+#chrome
+/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType fs -icon /Library/Application\ Support/SideIT/chrome.png -fullScreenIcon & sudo jamf policy -event googlechrome
+
+#drive
+/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType fs -icon /Library/Application\ Support/SideIT/drive.png -fullScreenIcon & sudo jamf policy -event googledrive
+
+#slack
+/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType fs -icon /Library/Application\ Support/SideIT/slack.png -fullScreenIcon & sudo jamf policy -event slack
+
+#zoom & set dock (first run)
+/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType fs -icon /Library/Application\ Support/SideIT/zoom.png -fullScreenIcon & sudo jamf policy -event zoominfo; sudo jamf policy -event modifyDock
+
+#settings > inSiderIntranet App
+/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType fs -icon /Library/Application\ Support/SideIT/intranet.png -fullScreenIcon & sudo jamf policy -event inSiderIntranet
+
+
+
+
+#settings > machine name
+/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType fs -icon /Library/Application\ Support/SideIT/settings1.png -fullScreenIcon & sudo jamf policy -event mbpname
+
+#settings > user fill
+/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType fs -icon /Library/Application\ Support/SideIT/settings2.png -fullScreenIcon & sudo jamf policy -event uploadUser
+
+
+#small break
+sleep 3
+
+#settings > dock
+/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType fs -icon /Library/Application\ Support/SideIT/settings3.png -fullScreenIcon & sudo jamf policy -event modifyDock
+
+#settings > filevault login alert
+/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper -windowType fs -icon /Library/Application\ Support/SideIT/filevaultenable.png -fullScreenIcon & sleep 5
+
+#close self service before rebooting
+killall Self\ Service
