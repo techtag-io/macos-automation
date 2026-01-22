@@ -1,0 +1,52 @@
+#!/bin/bash
+
+getUserName () {
+usernamepull="$(stat -f%Su /dev/console)"
+fullName="$(dscl . -read /Users/$usernamepull RealName | cut -d: -f2 | sed -e 's/^[ \t]*//' | grep -v "^$")"
+echo "Full name: "$fullName
+
+lowerCase=$(echo $fullName | tr "[:upper:]" "[:lower:]")
+echo "Full name lowercase: "$lowerCase
+
+userName=${lowerCase//[[:blank:]]/}
+echo "User Name: "$userName
+
+#replace space with period
+replaceSpace=${lowerCase// /.}
+echo "Turn space into period: "$replaceSpace
+
+#email=${replaceSpace}@side.com
+#echo $email
+}
+
+getUserName
+echo "Checking Username"
+
+let count=1
+echo "Coount: "$count
+
+while [ "$lowerCase" = "system administrator" ];
+do
+	echo "User is system administrator"
+	getUserName
+    
+	let count=$count+1
+    echo "Sleep 10 x "$count
+	sleep 10
+	
+	if [ $count == 1 ]; then
+		sudo jamf recon -room "sysadmin"
+	elif [ $count == 6 ]; then
+		echo "After a minute of attempting, system administrator is still the user, running recon and exiting"
+		sudo jamf recon -room "sysadmin"
+		exit 0
+	fi
+	
+done
+echo "User found, running recon"
+
+#sudo jamf recon -endUsername "$email" -ldapServer $3
+
+#sudo jamf recon -endUsername $replaceSpace -ldapServer $3
+
+sudo jamf recon -ldapServer $3
