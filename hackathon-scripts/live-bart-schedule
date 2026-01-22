@@ -1,0 +1,222 @@
+#!/bin/bash
+
+#parameters
+BART_API_KEY="ZAXL-PQDK-996T-DWEI"
+
+
+install_dialog () {
+	
+    updatedDialogVersion=2.5.3
+	dialog_bin="/usr/local/bin/dialog"
+	dialog_download_url="https://github.com/swiftDialog/swiftDialog/releases/download/v2.5.3/dialog-2.5.3-4785.pkg"
+	dialogDir='/usr/local/'
+	swiftDialogPKG="swiftDialog.pkg"
+	dialogAppDir="/Library/Application Support/Dialog/Dialog.app"
+    
+    wallpaperDir="/Library/Application Support/wallpaper/"
+    wallpaperImg="desktopwallpaper.jpg"
+    wallpaperPKGDir="/Library/Application Support/Jamf/Waiting Room/wallpaper.pkg"
+    
+    if [ -f "$wallpaperDir$wallpaperImg" ]; then
+    echo "Wallpaper found, skipping install"
+    else
+    echo "Installing wallpaper"
+    sudo /usr/sbin/installer -pkg "$wallpaperPKGDir" -target /
+    fi
+    
+	
+	#Check Dialog version
+	if [ -f $dialog_bin ]; then
+		echo "Dialog app found, checking version"
+        dialogVersion=$(defaults read /Library/Application\ Support/Dialog/Dialog.app/Contents/Info CFBundleShortVersionString)
+		echo "Dialog Version: "$dialogVersion
+
+		if [ $dialogVersion != $updatedDialogVersion ]; then
+			#if not equal, then update
+			echo "Dialog not up to date, updating..."
+   		    echo "Dialog app not found, downloading and installing dialog"
+	  	    ##Download swiftDialog
+	  	    sudo /usr/bin/curl -L "$dialog_download_url" -o "$dialogDir$swiftDialogPKG"
+	
+	    	##Installing Dialog
+	       sudo /usr/sbin/installer -pkg "$dialogDir$swiftDialogPKG" -target /
+		    sleep 5
+	
+		    #Cleanup
+		    sudo rm -r "$dialogDir$swiftDialogPKG"
+
+        else
+	        #if equal, do not update
+	        echo "Dialog Version Correct, skipping update"
+        fi
+        
+        
+        
+	else 
+		echo "Dialog app not found, downloading and installing dialog"
+	    ##Download swiftDialog
+	    sudo /usr/bin/curl -L "$dialog_download_url" -o "$dialogDir$swiftDialogPKG"
+	
+	    ##Installing Dialog
+	    sudo /usr/sbin/installer -pkg "$dialogDir$swiftDialogPKG" -target /
+		sleep 5
+	
+		#Cleanup
+		sudo rm -r "$dialogDir$swiftDialogPKG"
+	fi
+	
+	
+	
+		dialogIconDir="/Library/Application Support/SideIT/finishing.png"
+		dialogBackGroundDir="/Library/Application Support/wallpaper/desktopwallpaper.jpg"
+		dialogSlackURL="https://app.slack.com/client/T0XD2CN2V/CNW9PA7NG"
+		dialogHDURL="https://sideinc.freshservice.com/support/catalog/items/131"
+		dialogTitleFont="name=Arial-MT,colour=#CE87C1,size=30"
+	
+
+}
+
+
+
+
+
+#====================================
+# Regular Alert
+get_bart_status () {
+	BART_API_KEY="ZAXL-PQDK-996T-DWEI"
+	BSA_URL="https://api.bart.gov/api/bsa.aspx?cmd=bsa&key=${BART_API_KEY}&json=y"
+
+	# Fetch service advisories
+	bsa_response=$(curl -s "$BSA_URL")
+
+	# Display the full response for troubleshooting
+	echo "Full BART API Response:"
+	echo "$bsa_response"
+
+	sleep 2
+	
+	# Extract advisories text using sed for cdata-section
+	echo "BART Service Advisories:"
+	echo "$bsa_response" | sed -n 's/.*"description":{"#cdata-section":"\([^"]*\)"}.*/\1/p'
+	bart_status=$(echo "$bsa_response" | sed -n 's/.*"description":{"#cdata-section":"\([^"]*\)"}.*/\1/p')
+	
+	sleep 3
+	
+	if [ -n "$bart_status" ]; then
+	  msg_font="name=Arial-MT,size=18,colour=#FF0000"
+	else
+	  msg_font="name=Arial-MT,size=15"
+	fi
+	
+	
+}
+
+get_station_schedule () {
+
+
+echo "bart_api_countdown: "$bart_api_countdown
+
+	# Deduct 1 from the countdown
+let bart_api_countdown=$bart_api_countdown-1
+
+# When countdown reaches 0, run the special command and reset the countdown
+if (($bart_api_countdown == 0)); then
+  echo "Running special command on loop $i"
+
+
+# Replace with your BART API key
+API_KEY="ZAXL-PQDK-996T-DWEI"
+
+# Define the BART API URL for live departures from Civic Center station (CIVC)
+API_URL="http://api.bart.gov/api/etd.aspx?cmd=etd&orig=CIVC&json=y&key=$API_KEY"
+
+# Make the API request using curl and follow redirects
+response=$(curl -s -L "$API_URL")
+
+# Check if the response is valid (not empty)
+if [[ -z "$response" ]]; then
+    echo "Error: No response from the API."
+    exit 1
+fi
+
+# Print the raw response to debug and verify it's valid JSON
+echo "Raw API Response:"
+echo "$response"
+
+# Check if 'etd' data exists in the response
+if echo "$response" | jq -e '.root.station[0].etd' >/dev/null; then
+    # Get tidy times (without quotes and properly formatted)
+    get_times=$(echo "$response" | jq -r '.root.station[0].etd[] | 
+      if .estimate[0].minutes == "Leaving" then
+        "\(.destination): Leaving"
+      else
+        "\(.destination): \(.estimate[0].minutes) min"
+      end')
+
+    # Print each departure time in a clean list format
+    echo "Upcoming Train Departures:"
+	live_schedule_times=""
+	for time in "$get_times"; do
+	    live_schedule_times+="$time"$'\n'
+	done
+	echo "Travis logs:"
+	echo "$live_schedule_times"
+else
+    echo "Error: No ETD (estimated departure) data available in the response."
+fi
+
+	
+}
+
+
+bart_page () {
+
+get_bart_status
+get_station_schedule
+
+dTitle="BART - Live Transit Times From Civic Center"
+dMessage="Bart Current Status - Any delays will be posted here:\n
+$bart_status \n\n
+
+Civic Center Schedule: \n
+**$live_schedule_times**"
+
+timer=20 # 60 seconds * 10 min = 600
+dIconDir="$dialogIconDir"
+dBackDir="$dialogBackGroundDir"
+dInfoBox="__Welcome to Side!__\n\n
+__580 4th St, San Francisco, CA__
+\n\n
+(415) 525-4913
+\n\n
+__Need Help?__  
+helpdesk@side.com"
+
+userTimeSelection=$(${dialog_bin} \
+    --title "$dTitle" \
+	--titlefont "$dialogTitleFont" \
+	--message "$dMessage" \
+	--messagefont "$msg_font" \
+    --icon "$dIconDir" \
+	--iconsize 120 \
+    --button1text "$dButton1" \
+	--height 100% \
+	--width 100% \
+	--background "$dBackDir" \
+	--infobox "$dInfoBox" \
+    --timer "$timer" \
+	--webcontent "https://www.bart.gov/schedules/eta/CIVC" 
+    #--blurscreen
+    #--button2text "$dButton2" \
+
+)
+
+
+}
+
+
+###### Regular Alert DONE
+
+install_dialog
+
+bart_page
