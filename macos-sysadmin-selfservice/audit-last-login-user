@@ -1,0 +1,75 @@
+#!/bin/sh
+
+#Get last user from text file
+LASTUSER="$(stat -f%Su /dev/console)"
+echo "first pull: $LASTUSER"
+
+#set Dir parameter
+LogDir='/Library/loginuser.txt'
+
+#until the user account is not root, loop the script
+until [ "$LASTUSER" != "root" ]
+do 
+
+echo "waiting for LASTUSER... Sleep 5: $LASTUSER"
+sleep 5
+
+done
+
+echo "$LASTUSER is not root, proceeding..."
+echo "Checking for $LogDir"
+
+#Does text file exist?
+
+#if [[ -f /Library/loginuser.txt ]]; then
+if [[ -f $LogDir ]]; then
+
+	#yes - pull last name
+	echo "File exists, skipping creation of file..."
+	
+else
+	
+	#no - create it and put in current name
+	echo "Creating file with last user..."
+	sudo echo $LASTUSER >> $LogDir
+    echo "No need to push, exiting script"
+    exit 0
+
+	
+fi
+
+#Pull last user
+RECLOGIN=$( tail -n 1 $LogDir )
+echo "$RECLOGIN pulled from file"
+
+
+####### Matching
+
+if [ "$LASTUSER" == "$RECLOGIN" ]; then
+	echo "$LASTUSER = $RECLOGIN , skipping and exiting"
+    exit 0
+    
+    #script alert
+#osascript <<EOF 
+
+#display dialog "SAME USER!" with title "SAME USER!" buttons ("OK!")
+
+#EOF
+    
+    
+	exit 0
+else
+	echo $LASTUSER >> $LogDir
+	echo "$LASTUSER != $RECLOGIN ... run stuff"
+    sudo jamf policy -event uploadUser
+    /usr/local/bin/jamf recon -room "Check User"
+    exit 0
+    
+        #script alert
+#osascript <<EOF 
+
+#display dialog "NEW USER!" with title "NEW USER!" buttons ("OK!")
+
+#EOF
+	
+fi
