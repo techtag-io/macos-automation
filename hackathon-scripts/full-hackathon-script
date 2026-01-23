@@ -1,5 +1,624 @@
 #!/bin/bash
 
+################################################################################
+# Transit Hub Information Dashboard
+# Description: Comprehensive transit and service monitoring dashboard that
+#              rotates between traffic, BART, Caltrain, and service status
+#              displays with live API data updates
+# Organization: Side, Inc
+# Location: 580 4th St, San Francisco, CA
+# Contact: helpdesk@side.com
+# Date: January 23, 2026
+################################################################################
+
+set -euo pipefail
+
+################################################################################
+# Global Configuration Constants
+################################################################################
+
+# API Keys and Endpoints
+readonly CALTRAIN_API_KEY="key"
+readonly GEMINI_API_KEY="key"
+readonly BART_API_KEY="key"
+
+readonly CALTRAIN_API_URL="http://api.511.org/transit/servicealerts?api_key=${CALTRAIN_API_KEY}&agency=CT"
+readonly BART_BSA_URL="https://api.bart.gov/api/bsa.aspx?cmd=bsa&key=${BART_API_KEY}&json=y"
+readonly BART_ETD_URL="http://api.bart.gov/api/etd.aspx?cmd=etd&orig=CIVC&json=y&key=${BART_API_KEY}"
+
+# API Rate Limiting Configuration
+readonly API_REFRESH_CYCLES=3
+CALTRAIN_API_COUNTDOWN=4  # Start with immediate fetch
+BART_API_COUNTDOWN=4      # Start with immediate fetch
+
+# Cached Data Storage
+CALTRAIN_ALERTS=""
+CALTRAIN_LAST_UPDATE=""
+BART_STATUS=""
+BART_SCHEDULE=""
+BART_LAST_UPDATE=""
+
+# Service Status Storage
+GOOGLE_WWW_STATUS=""
+GOOGLE_SERVICE_STATUS=""
+OKTA_WWW_STATUS=""
+OKTA_SERVICE_STATUS=""
+SLACK_WWW_STATUS=""
+SLACK_SERVICE_STATUS=""
+ATLASSIAN_WWW_STATUS=""
+ATLASSIAN_SERVICE_STATUS=""
+ZOOM_WWW_STATUS=""
+ZOOM_SERVICE_STATUS=""
+SIDE_WWW_STATUS=""
+SIDE_APP_STATUS=""
+
+# Traffic Data Storage
+declare -A TRAFFIC_TIMES=(
+    ["Berkeley"]=""
+    ["Fremont"]=""
+    ["MorganHill"]=""
+    ["Oakland"]=""
+    ["PaloAlto"]=""
+    ["Pier39"]=""
+    ["SanJose"]=""
+    ["WalnutCreek"]=""
+    ["OAK"]=""
+    ["SFO"]=""
+    ["SJC"]=""
+)
+
+# swiftDialog Configuration
+readonly DIALOG_VERSION="2.5.3"
+readonly DIALOG_BUILD="4785"
+readonly DIALOG_BIN="/usr/local/bin/dialog"
+readonly DIALOG_APP="/Library/Application Support/Dialog/Dialog.app"
+readonly DIALOG_DOWNLOAD_URL="https://github.com/swiftDialog/swiftDialog/releases/download/v${DIALOG_VERSION}/dialog-${DIALOG_VERSION}-${DIALOG_BUILD}.pkg"
+readonly DIALOG_INSTALL_DIR="/usr/local/"
+readonly DIALOG_PKG_NAME="swiftDialog.pkg"
+
+# Asset Paths
+readonly WALLPAPER_DIR="/Library/Application Support/wallpaper/"
+readonly WALLPAPER_FILE="desktopwallpaper.jpg"
+readonly WALLPAPER_PKG="/Library/Application Support/Jamf/Waiting Room/wallpaper.pkg"
+readonly ICON_PATH="/Library/Application Support/SideIT/finishing.png"
+
+# Dialog Styling
+readonly TITLE_FONT="name=Arial-MT,colour=#CE87C1,size=30"
+readonly MESSAGE_FONT_NORMAL="name=Arial-MT,size=15"
+readonly MESSAGE_FONT_ALERT="name=Arial-MT,size=18,colour=#FF0000"
+
+# Display Settings
+readonly DISPLAY_TIMER=15  # seconds per slide
+
+# Organization Information
+readonly ORG_NAME="Side, Inc"
+readonly ORG_ADDRESS="580 4th St, San Francisco, CA"
+readonly ORG_PHONE="(415) 525-4913"
+readonly ORG_EMAIL="helpdesk@side.com"
+readonly HELPDESK_URL="https://sideinc.freshservice.com/support/catalog/items/131"
+
+################################################################################
+# Dependency Management Functions
+################################################################################
+
+install_wallpaper() {
+    local wallpaper_path="${WALLPAPER_DIR}${WALLPAPER_FILE}"
+    
+    if [ -f "${wallpaper_path}" ]; then
+        echo "[INFO] Wallpaper already installed"
+        return 0
+    fi
+    
+    if [ ! -f "${WALLPAPER_PKG}" ]; then
+        echo "[WARNING] Wallpaper package not found"
+        return 1
+    fi
+    
+    echo "[INFO] Installing wallpaper..."
+    sudo /usr/sbin/installer -pkg "${WALLPAPER_PKG}" -target / 2>/dev/null
+    [ -f "${wallpaper_path}" ] && echo "[SUCCESS] Wallpaper installed"
+}
+
+get_installed_dialog_version() {
+    if [ -f "${DIALOG_BIN}" ] && [ -d "${DIALOG_APP}" ]; then
+        defaults read "${DIALOG_APP}/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo ""
+    else
+        echo ""
+    fi
+}
+
+install_swift_dialog() {
+    local installed_version
+    local temp_pkg_path="${DIALOG_INSTALL_DIR}${DIALOG_PKG_NAME}"
+    
+    installed_version=$(get_installed_dialog_version)
+    
+    if [ "${installed_version}" = "${DIALOG_VERSION}" ]; then
+        echo "[INFO] swiftDialog ${DIALOG_VERSION} already installed"
+        return 0
+    fi
+    
+    echo "[INFO] Installing swiftDialog ${DIALOG_VERSION}..."
+    
+    if ! sudo /usr/bin/curl -L "${DIALOG_DOWNLOAD_URL}" -o "${temp_pkg_path}" 2>/dev/null; then
+        echo "[ERROR] Failed to download swiftDialog"
+        return 1
+    fi
+    
+    if ! sudo /usr/sbin/installer -pkg "${temp_pkg_path}" -target / 2>/dev/null; then
+        echo "[ERROR] Failed to install swiftDialog"
+        sudo rm -f "${temp_pkg_path}"
+        return 1
+    fi
+    
+    sleep 5
+    sudo rm -f "${temp_pkg_path}"
+    
+    echo "[SUCCESS] swiftDialog ${DIALOG_VERSION} installed"
+}
+
+################################################################################
+# Service Status Functions
+################################################################################
+
+check_google_service_status() {
+    local status_page
+    
+    status_page=$(curl -s --connect-timeout 10 https://www.google.com/appsstatus/ 2>/dev/null)
+    
+    if echo "${status_page}" | grep -q 'class="status yellow"\|class="status red"'; then
+        GOOGLE_SERVICE_STATUS="Experiencing issues"
+    else
+        GOOGLE_SERVICE_STATUS="✅"
+    fi
+}
+
+check_okta_service_status() {
+    local status
+    
+    status=$(curl -s --connect-timeout 10 https://status.okta.com/api/v2/status.json 2>/dev/null)
+    
+    if echo "${status}" | grep -q '"status":"active"\|"status":"degraded_performance"'; then
+        OKTA_SERVICE_STATUS="Experiencing issues"
+    else
+        OKTA_SERVICE_STATUS="✅"
+    fi
+}
+
+check_slack_service_status() {
+    local page
+    
+    page=$(curl -s --connect-timeout 10 https://slack-status.com/ 2>/dev/null)
+    
+    if echo "${page}" | grep -q "Some users may be having trouble"; then
+        SLACK_SERVICE_STATUS="Experiencing issues"
+    else
+        SLACK_SERVICE_STATUS="✅"
+    fi
+}
+
+check_zoom_service_status() {
+    local status incidents
+    
+    status=$(curl -s --connect-timeout 10 https://api.zoom.us/v2/metrics/status 2>/dev/null)
+    incidents=$(echo "${status}" | jq -r '.incidents | length' 2>/dev/null || echo "0")
+    
+    if [ "${incidents}" -gt 0 ]; then
+        ZOOM_SERVICE_STATUS="Experiencing ${incidents} incidents"
+    else
+        ZOOM_SERVICE_STATUS="✅"
+    fi
+}
+
+check_atlassian_service_status() {
+    local status incidents
+    
+    status=$(curl -s --connect-timeout 10 https://api.status.atlassian.com/1.0/status 2>/dev/null)
+    incidents=$(echo "${status}" | jq -r '.incidents | length' 2>/dev/null || echo "0")
+    
+    if [ "${incidents}" -gt 0 ]; then
+        ATLASSIAN_SERVICE_STATUS="Experiencing ${incidents} incidents"
+    else
+        ATLASSIAN_SERVICE_STATUS="✅"
+    fi
+}
+
+check_side_app_status() {
+    local http_code
+    
+    http_code=$(curl -s -w "%{http_code}" -o /dev/null --connect-timeout 10 \
+                https://agent.sideinc.com/txm/api/health 2>/dev/null)
+    
+    if [ "${http_code}" -eq 200 ]; then
+        SIDE_APP_STATUS="✅"
+    else
+        SIDE_APP_STATUS="HTTP ${http_code}"
+    fi
+}
+
+check_website_status() {
+    local service_name="$1"
+    local url="$2"
+    local response
+    
+    response=$(curl -s --connect-timeout 10 "${url}" 2>/dev/null)
+    
+    if echo "${response}" | grep -q "is UP"; then
+        echo "✅"
+    elif echo "${response}" | grep -q "is DOWN"; then
+        echo "DOWN"
+    else
+        echo "Unknown"
+    fi
+}
+
+fetch_all_service_statuses() {
+    echo "[INFO] Fetching service statuses..."
+    
+    # Service-specific status checks
+    check_google_service_status &
+    check_okta_service_status &
+    check_slack_service_status &
+    check_zoom_service_status &
+    check_atlassian_service_status &
+    check_side_app_status &
+    
+    # Website availability checks
+    GOOGLE_WWW_STATUS=$(check_website_status "Google" "https://www.isitdownrightnow.com/google.com.html") &
+    OKTA_WWW_STATUS=$(check_website_status "Okta" "https://www.isitdownrightnow.com/okta.com.html") &
+    SLACK_WWW_STATUS=$(check_website_status "Slack" "https://www.isitdownrightnow.com/slack.com.html") &
+    ATLASSIAN_WWW_STATUS=$(check_website_status "Atlassian" "https://www.isitdownrightnow.com/atlassian.com.html") &
+    ZOOM_WWW_STATUS=$(check_website_status "Zoom" "https://www.isitdownrightnow.com/zoom.us.html") &
+    SIDE_WWW_STATUS=$(check_website_status "Side" "https://www.isitdownrightnow.com/side.com.html") &
+    
+    wait
+    echo "[SUCCESS] Service statuses updated"
+}
+
+################################################################################
+# Caltrain Data Functions
+################################################################################
+
+process_alerts_with_ai() {
+    local raw_alerts="$1"
+    local cleaned_alerts
+    
+    if [ -z "${raw_alerts}" ]; then
+        echo ""
+        return 0
+    fi
+    
+    if ! command -v gemini-cli &> /dev/null; then
+        echo "${raw_alerts}"
+        return 0
+    fi
+    
+    cleaned_alerts=$(gemini-cli prompt "Please clean up the following text and organize it into a bullet point list with each item separated by new lines, removing any extraneous information and only leave the list items in English. Remove anything with local week day. Here's the text: ${raw_alerts}" --key "${GEMINI_API_KEY}" 2>/dev/null)
+    
+    echo "${cleaned_alerts:-${raw_alerts}}"
+}
+
+fetch_caltrain_data() {
+    ((CALTRAIN_API_COUNTDOWN--)) || true
+    
+    if [ "${CALTRAIN_API_COUNTDOWN}" -ne 0 ]; then
+        echo "[INFO] Using cached Caltrain data (${CALTRAIN_API_COUNTDOWN} cycles remaining)"
+        return 0
+    fi
+    
+    echo "[INFO] Fetching live Caltrain alerts..."
+    
+    local response
+    response=$(curl -s --connect-timeout 10 "${CALTRAIN_API_URL}" 2>/dev/null)
+    
+    if [ -n "${response}" ]; then
+        CALTRAIN_ALERTS=$(process_alerts_with_ai "${response}")
+        CALTRAIN_LAST_UPDATE=$(date +"%m-%d-%Y %H:%M:%S")
+        echo "[SUCCESS] Caltrain data updated at ${CALTRAIN_LAST_UPDATE}"
+    else
+        CALTRAIN_ALERTS="Unable to retrieve alerts"
+        echo "[WARNING] Failed to fetch Caltrain data"
+    fi
+    
+    CALTRAIN_API_COUNTDOWN=${API_REFRESH_CYCLES}
+}
+
+################################################################################
+# BART Data Functions
+################################################################################
+
+fetch_bart_status() {
+    local response
+    
+    response=$(curl -s --connect-timeout 10 "${BART_BSA_URL}" 2>/dev/null)
+    
+    if [ -n "${response}" ]; then
+        BART_STATUS=$(echo "${response}" | sed -n 's/.*"description":{"#cdata-section":"\([^"]*\)"}.*/\1/p')
+        [ -z "${BART_STATUS}" ] && BART_STATUS="No current delays"
+    else
+        BART_STATUS="Unable to retrieve status"
+    fi
+}
+
+fetch_bart_schedule() {
+    local response
+    
+    response=$(curl -s -L --connect-timeout 10 "${BART_ETD_URL}" 2>/dev/null)
+    
+    if [ -z "${response}" ]; then
+        BART_SCHEDULE="Unable to retrieve schedule"
+        return 1
+    fi
+    
+    if ! echo "${response}" | jq -e '.root.station[0].etd' >/dev/null 2>&1; then
+        BART_SCHEDULE="No departure data available"
+        return 1
+    fi
+    
+    BART_SCHEDULE=$(echo "${response}" | jq -r '.root.station[0].etd[] | 
+        if .estimate[0].minutes == "Leaving" then
+            "\(.destination): Leaving"
+        else
+            "\(.destination): \(.estimate[0].minutes) min"
+        end' 2>/dev/null)
+    
+    [ -z "${BART_SCHEDULE}" ] && BART_SCHEDULE="No trains scheduled"
+}
+
+fetch_bart_data() {
+    ((BART_API_COUNTDOWN--)) || true
+    
+    if [ "${BART_API_COUNTDOWN}" -ne 0 ]; then
+        echo "[INFO] Using cached BART data (${BART_API_COUNTDOWN} cycles remaining)"
+        return 0
+    fi
+    
+    echo "[INFO] Fetching live BART data..."
+    
+    fetch_bart_status &
+    fetch_bart_schedule &
+    wait
+    
+    BART_LAST_UPDATE=$(date +"%m-%d-%Y %H:%M:%S")
+    echo "[SUCCESS] BART data updated at ${BART_LAST_UPDATE}"
+    
+    BART_API_COUNTDOWN=${API_REFRESH_CYCLES}
+}
+
+################################################################################
+# Traffic Data Functions
+################################################################################
+
+get_travel_time() {
+    local shortcut_name="$1"
+    local result
+    
+    result=$(osascript 2>/dev/null <<EOF
+tell application "Shortcuts Events"
+    set shortcutResult to run shortcut "${shortcut_name}"
+end tell
+
+set resultText to ""
+repeat with anItem in shortcutResult
+    set resultText to resultText & anItem & " "
+end repeat
+
+resultText
+EOF
+)
+    
+    echo "${result:-N/A}"
+}
+
+fetch_traffic_data() {
+    echo "[INFO] Fetching live traffic data..."
+    
+    TRAFFIC_TIMES["Pier39"]=$(get_travel_time "Travel Time Pier 39") &
+    TRAFFIC_TIMES["Oakland"]=$(get_travel_time "Travel Time Oakland") &
+    TRAFFIC_TIMES["Berkeley"]=$(get_travel_time "Travel Time Berkeley") &
+    TRAFFIC_TIMES["WalnutCreek"]=$(get_travel_time "Travel Time Walnut Creek") &
+    TRAFFIC_TIMES["Fremont"]=$(get_travel_time "Travel Time Fremont") &
+    TRAFFIC_TIMES["SanJose"]=$(get_travel_time "Travel Time San Jose") &
+    TRAFFIC_TIMES["PaloAlto"]=$(get_travel_time "Travel Time Palo Alto") &
+    TRAFFIC_TIMES["MorganHill"]=$(get_travel_time "Travel Time Morgan Hill") &
+    TRAFFIC_TIMES["SFO"]=$(get_travel_time "Travel Time SFO") &
+    TRAFFIC_TIMES["OAK"]=$(get_travel_time "Travel Time OAK") &
+    TRAFFIC_TIMES["SJC"]=$(get_travel_time "Travel Time SJC") &
+    
+    wait
+    echo "[SUCCESS] Traffic data updated"
+}
+
+################################################################################
+# Dialog Display Functions
+################################################################################
+
+show_dialog() {
+    local title="$1"
+    local message="$2"
+    local webcontent="$3"
+    local infobox="$4"
+    local message_font="${5:-${MESSAGE_FONT_NORMAL}}"
+    
+    ${DIALOG_BIN} \
+        --title "${title}" \
+        --titlefont "${TITLE_FONT}" \
+        --message "${message}" \
+        --messagefont "${message_font}" \
+        --icon "${ICON_PATH}" \
+        --iconsize 120 \
+        --height 100% \
+        --width 100% \
+        --background "${WALLPAPER_DIR}${WALLPAPER_FILE}" \
+        --infobox "${infobox}" \
+        --timer "${DISPLAY_TIMER}" \
+        --webcontent "${webcontent}" \
+        --button1text "Quit" 2>/dev/null
+    
+    local return_code=$?
+    [ "${return_code}" -eq 0 ] && exit 0
+}
+
+display_startup_screen() {
+    local title="Loading data... Please wait"
+    local message="Currently downloading the latest information, please wait..."
+    local webcontent="https://cdn.dribbble.com/users/5436944/screenshots/14793980/media/eb75f36d10810389e8c0ddefb7423e34.gif"
+    local infobox="__Welcome to ${ORG_NAME}!__\n\n__${ORG_ADDRESS}__\n\n${ORG_PHONE}\n\n__Need Help?__\n${ORG_EMAIL}"
+    
+    echo "[INFO] Displaying startup screen"
+    
+    ${DIALOG_BIN} \
+        --title "${title}" \
+        --titlefont "${TITLE_FONT}" \
+        --message "${message}" \
+        --messagefont "${MESSAGE_FONT_NORMAL}" \
+        --icon "${ICON_PATH}" \
+        --iconsize 120 \
+        --height 100% \
+        --width 100% \
+        --background "${WALLPAPER_DIR}${WALLPAPER_FILE}" \
+        --infobox "${infobox}" \
+        --webcontent "${webcontent}" \
+        --button1text "Quit" 2>/dev/null &
+    
+    local dialog_pid=$!
+    
+    # Fetch initial data in background
+    fetch_traffic_data
+    
+    # Kill startup dialog
+    kill "${dialog_pid}" 2>/dev/null || true
+    sleep 1
+}
+
+display_traffic_screen() {
+    echo "[INFO] Displaying traffic information"
+    
+    local title="Live Traffic! Drive Time Estimations From Side Office."
+    local message="Map Powered by Google. ETA's Powered By Apple Maps.\n\nThe list on the left panel shows live estimated driving time from 580 4th St to those downtown locations."
+    local webcontent="https://www.google.com/maps/@37.6139506,-122.4261246,10z/data=!5m1!1e1?entry=ttu"
+    local infobox="__Welcome to ${ORG_NAME}!__\n\n__${ORG_ADDRESS}__\n\n${ORG_PHONE}\n\n__Need Help?__\n[${ORG_EMAIL}](${HELPDESK_URL})\n\n- - - - - - - - -\n__🚗 Driving To:__\n\n**Berkeley:** ${TRAFFIC_TIMES[Berkeley]}\n**Fremont:** ${TRAFFIC_TIMES[Fremont]}\n**Morgan Hill:** ${TRAFFIC_TIMES[MorganHill]}\n**Oakland:** ${TRAFFIC_TIMES[Oakland]}\n**Palo Alto:** ${TRAFFIC_TIMES[PaloAlto]}\n**Pier 39:** ${TRAFFIC_TIMES[Pier39]}\n**San Jose:** ${TRAFFIC_TIMES[SanJose]}\n**Walnut Creek:** ${TRAFFIC_TIMES[WalnutCreek]}\n\n- - - - - - - - -\n\n__✈️ Airports:__\n\n**Oakland Intl:** ${TRAFFIC_TIMES[OAK]}\n**San Francisco Intl:** ${TRAFFIC_TIMES[SFO]}\n**San Jose Intl:** ${TRAFFIC_TIMES[SJC]}"
+    
+    show_dialog "${title}" "${message}" "${webcontent}" "${infobox}" "name=Arial-MT,size=13"
+}
+
+display_bart_screen() {
+    echo "[INFO] Displaying BART information"
+    
+    fetch_bart_data
+    
+    local countdown_label
+    [ "${BART_API_COUNTDOWN}" -eq 0 ] && countdown_label="Running Now!" || countdown_label="${BART_API_COUNTDOWN} cycles remaining"
+    
+    local message_font
+    [ -n "${BART_STATUS}" ] && [ "${BART_STATUS}" != "No current delays" ] && message_font="${MESSAGE_FONT_ALERT}" || message_font="${MESSAGE_FONT_NORMAL}"
+    
+    local title="BART - Live Transit Times From Civic Center"
+    local message="**Next live status update in:** ${countdown_label}  **Last live update:** ${BART_LAST_UPDATE}\n\nBART Current Status - Any delays will be posted here:\n${BART_STATUS}\n\nCivic Center Schedule:\n${BART_SCHEDULE}"
+    local webcontent="https://www.bart.gov/schedules/eta/CIVC"
+    local infobox="__Welcome to ${ORG_NAME}!__\n\n__${ORG_ADDRESS}__\n\n${ORG_PHONE}\n\n__Need Help?__\n${ORG_EMAIL}"
+    
+    show_dialog "${title}" "${message}" "${webcontent}" "${infobox}" "${message_font}"
+}
+
+display_caltrain_screen() {
+    echo "[INFO] Displaying Caltrain information"
+    
+    fetch_caltrain_data
+    
+    local countdown_label
+    [ "${CALTRAIN_API_COUNTDOWN}" -eq 0 ] && countdown_label="Running Now!" || countdown_label="${CALTRAIN_API_COUNTDOWN} cycles remaining"
+    
+    local message_font
+    [ -n "${CALTRAIN_ALERTS}" ] && message_font="${MESSAGE_FONT_ALERT}" || message_font="${MESSAGE_FONT_NORMAL}"
+    
+    local title="Caltrain - Live Transit Times From San Francisco"
+    local message="**Next live status update in:** ${countdown_label}  **Last live update:** ${CALTRAIN_LAST_UPDATE}\n\nCaltrain - Any delays will be posted here:\n${CALTRAIN_ALERTS}\n\n\nSan Francisco Schedule"
+    local webcontent="https://www.caltrain.com/station/sanfrancisco"
+    local infobox="__Welcome to ${ORG_NAME}!__\n\n__${ORG_ADDRESS}__\n\n${ORG_PHONE}\n\n__Need Help?__\n${ORG_EMAIL}"
+    
+    show_dialog "${title}" "${message}" "${webcontent}" "${infobox}" "${message_font}"
+}
+
+display_services_screen() {
+    echo "[INFO] Displaying service status information"
+    
+    fetch_all_service_statuses
+    
+    local title="Service Statuses"
+    local message="Website Statuses are pulled from isitdown.com - these are just for the main website and not the service.\nServices Statuses are pulled from their respective status pages.\n\n**Google** WWW: ${GOOGLE_WWW_STATUS}   |   Service: ${GOOGLE_SERVICE_STATUS}\n\n**Okta** WWW: ${OKTA_WWW_STATUS}   |   Service: ${OKTA_SERVICE_STATUS}\n\n**Slack** WWW: ${SLACK_WWW_STATUS}   |   Service: ${SLACK_SERVICE_STATUS}\n\n**Atlassian** WWW: ${ATLASSIAN_WWW_STATUS}   |   Service: ${ATLASSIAN_SERVICE_STATUS}\n\n**Zoom** WWW: ${ZOOM_WWW_STATUS}   |   Service: ${ZOOM_SERVICE_STATUS}\n\n**Side** WWW: ${SIDE_WWW_STATUS}   |   Service: ${SIDE_APP_STATUS}"
+    local webcontent="https://i.gifer.com/PYHc.gif"
+    local infobox="__Welcome to ${ORG_NAME}!__\n\n__${ORG_ADDRESS}__\n\n${ORG_PHONE}\n\n__Need Help?__\n[${ORG_EMAIL}](${HELPDESK_URL})"
+    
+    show_dialog "${title}" "${message}" "${webcontent}" "${infobox}" "name=Arial-MT,size=20"
+}
+
+################################################################################
+# Main Execution Loop
+################################################################################
+
+main() {
+    echo "════════════════════════════════════════════════════════════"
+    echo "Transit Hub Information Dashboard - Starting"
+    echo "Location: ${ORG_ADDRESS}"
+    echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "════════════════════════════════════════════════════════════"
+    
+    # Install dependencies
+    echo "[STEP 1/2] Installing dependencies..."
+    install_wallpaper || echo "[WARNING] Wallpaper installation skipped"
+    
+    if ! install_swift_dialog; then
+        echo "[ERROR] Failed to install swiftDialog"
+        exit 1
+    fi
+    
+    if [ ! -x "${DIALOG_BIN}" ]; then
+        echo "[ERROR] swiftDialog not found"
+        exit 1
+    fi
+    
+    # Display startup and fetch initial data
+    echo "[STEP 2/2] Loading initial data..."
+    display_startup_screen
+    
+    # Main display loop
+    echo "[INFO] Starting continuous display loop..."
+    
+    while true; do
+        echo "────────────────────────────────────────────────────────────"
+        echo "Loop iteration: $(date '+%H:%M:%S')"
+        echo "────────────────────────────────────────────────────────────"
+        
+        # Cycle through all displays
+        display_traffic_screen & fetch_bart_data; wait
+        display_bart_screen & fetch_caltrain_data; wait
+        display_caltrain_screen & fetch_all_service_statuses; wait
+        display_services_screen & fetch_traffic_data; wait
+        
+        sleep 2
+    done
+}
+
+################################################################################
+# Script Execution
+################################################################################
+
+# Trap to ensure clean exit
+trap 'echo "[INFO] Dashboard stopped"; killall Dialog 2>/dev/null; exit 0' INT TERM
+
+# Execute main function
+main "$@"
+
+
+
+
+
+
+----OG
+
+#!/bin/bash
+
 #Dialog 1: Loading
 #Dialog 2: Live Traffic
 #Dialog 3: Live Bart
@@ -11,9 +630,9 @@ set_master_variables () {
 	
 	
 	#API Keys
-	caltrain_api_key="1a4e65dc-fd7b-44c0-a2b1-488ed804e59c"
-	gemini_key="AIzaSyAornUrFLPgMM26YEKKAMzOUKA5igEosHo"
-	BART_API_KEY="ZAXL-PQDK-996T-DWEI"
+	caltrain_api_key="key"
+	gemini_key="key"
+	BART_API_KEY="key"
 	
 	#setting limits
 	caltrain_api_countdown=4
