@@ -4,7 +4,6 @@
 # Gemini API Status Checker
 # Description: Monitors the availability of the Gemini API service
 # Author: Travis Green
-# Date: Oct 1, 2025
 ################################################################################
 
 set -euo pipefail
