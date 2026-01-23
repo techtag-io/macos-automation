@@ -1,3 +1,686 @@
+
+#!/usr/bin/env bash
+#
+# Hackathon 2024 – Side Live Operations Board
+#
+# Description:
+#   Rotating swiftDialog dashboard showing:
+#     - Live driving times from the Side SF office
+#     - BART status and Civic Center departures
+#     - Caltrain service alerts
+#     - Core SaaS service and website statuses
+#
+# Requirements:
+#   - macOS with: swiftDialog, Shortcuts, Apple Maps
+#   - CLI tools: curl, jq, osascript, pbcopy/pbpaste
+#   - APIs: BART, 511.org (Caltrain), Gemini, external status pages
+#
+# Dialog sequence:
+#   1. Loading dialog + initial driving times
+#   2. Live Traffic (driving ETA + map)
+#   3. BART (alerts + Civic Center schedule + webview)
+#   4. Caltrain (alerts via 511 + Gemini cleanup + webview)
+#   5. Service Status (SaaS + website uptime)
+#
+# Notes:
+#   - Slides rotate in an endless loop.
+#   - BART / Caltrain API calls are rate‑limited via countdown counters.
+#   - Driving times are refreshed between slides to avoid API/shortcut spam.
+
+set -euo pipefail
+
+#######################################
+# Global configuration
+#######################################
+
+set_master_variables() {
+  # API keys (configure via environment or here)
+  caltrain_api_key="${CALTRAIN_API_KEY:-your-511-org-api-key}"
+  gemini_key="${GEMINI_KEY:-your-gemini-cli-api-key}"
+  BART_API_KEY="${BART_API_KEY:-your-bart-api-key}"
+
+  # Rate‑limit state
+  caltrain_api_countdown=4
+  caltrain_api_pull_time="$(date +"%m-%d-%Y %H:%M:%S")"
+
+  bart_api_countdown=4
+  bart_api_pull_time="$(date +"%m-%d-%Y %H:%M:%S")"
+
+  # swiftDialog paths / versions
+  updatedDialogVersion="2.5.3"
+  dialog_bin="/usr/local/bin/dialog"
+  dialog_download_url="https://github.com/swiftDialog/swiftDialog/releases/download/v2.5.3/dialog-2.5.3-4785.pkg"
+  dialogDir="/usr/local/"
+  swiftDialogPKG="swiftDialog.pkg"
+  dialogAppDir="/Library/Application Support/Dialog/Dialog.app"
+
+  # Wallpaper / branding
+  wallpaperDir="/Library/Application Support/wallpaper/"
+  wallpaperImg="desktopwallpaper.jpg"
+  wallpaperPKGDir="/Library/Application Support/Jamf/Waiting Room/wallpaper.pkg"
+
+  dialogTimer=15
+  dialogIconDir="/Library/Application Support/SideIT/finishing.png"
+  dialogBackGroundDir="/Library/Application Support/wallpaper/desktopwallpaper.jpg"
+  dialogSlackURL="https://app.slack.com/client/T0XD2CN2V/CNW9PA7NG"
+  dialogHDURL="https://sideinc.freshservice.com/support/catalog/items/131"
+  dialogTitleFont="name=Arial-MT,colour=#CE87C1,size=30"
+}
+
+#######################################
+# Dialog installation / validation
+#######################################
+
+install_dialog() {
+  # Ensure wallpaper is present
+  if [[ -f "${wallpaperDir}${wallpaperImg}" ]]; then
+    echo "Wallpaper present, skipping install."
+  else
+    echo "Installing wallpaper package..."
+    sudo /usr/sbin/installer -pkg "${wallpaperPKGDir}" -target /
+  fi
+
+  # Ensure swiftDialog is present and up to date
+  if [[ -x "${dialog_bin}" ]]; then
+    echo "swiftDialog found, checking version..."
+    dialogVersion="$(defaults read "${dialogAppDir}/Contents/Info" CFBundleShortVersionString)"
+    echo "swiftDialog version: ${dialogVersion}"
+
+    if [[ "${dialogVersion}" != "${updatedDialogVersion}" ]]; then
+      echo "swiftDialog out of date, updating..."
+      sudo /usr/bin/curl -L "${dialog_download_url}" -o "${dialogDir}${swiftDialogPKG}"
+      sudo /usr/sbin/installer -pkg "${dialogDir}${swiftDialogPKG}" -target /
+      sleep 5
+      sudo rm -f "${dialogDir}${swiftDialogPKG}"
+    else
+      echo "swiftDialog is up to date, skipping update."
+    fi
+  else
+    echo "swiftDialog not found, installing..."
+    sudo /usr/bin/curl -L "${dialog_download_url}" -o "${dialogDir}${swiftDialogPKG}"
+    sudo /usr/sbin/installer -pkg "${dialogDir}${swiftDialogPKG}" -target /
+    sleep 5
+    sudo rm -f "${dialogDir}${swiftDialogPKG}"
+  fi
+}
+
+#######################################
+# Services slide – dialog + data
+#######################################
+
+services_dialog() {
+  local dTitle dMessage dButton1 timer dIconDir dBackDir dInfoBox returncode
+
+  dTitle="Service Statuses"
+  dMessage=$(
+    cat <<EOF
+Website statuses are pulled from isitdownrightnow.com (main site only).
+Service statuses are pulled from each provider's status page.
+
+Google WWW:  ${status_google}   |   Service:  ${google_status}
+
+Okta WWW:    ${status_okta}     |   Service:  ${okta_status}
+
+Slack WWW:   ${status_slack}    |   Service:  ${slack_status}
+
+Atlassian WWW: ${status_atlassian} | Service: ${atlassian_status}
+
+Zoom WWW:    ${status_zoom}     |   Service:  ${zoom_status}
+
+Side WWW:    ${status_side}
+EOF
+  )
+
+  dButton1="Quit"
+  timer="${dialogTimer}"
+  dIconDir="${dialogIconDir}"
+  dBackDir="${dialogBackGroundDir}"
+  dInfoBox="__Welcome to Side!__\n\n__580 4th St, San Francisco, CA__\n\n(415) 525-4913\n\n__Need Help?__\n[helpdesk@side.com](${dialogHDURL})"
+
+  get_driving_traffic_data &
+
+  "${dialog_bin}" \
+    --title "${dTitle}" \
+    --titlefont "${dialogTitleFont}" \
+    --message "${dMessage}" \
+    --alignment center \
+    --messagefont "name=Arial-MT,size=20" \
+    --icon "${dIconDir}" \
+    --iconsize 120 \
+    --button1text "${dButton1}" \
+    --height 100% \
+    --width 100% \
+    --background "${dBackDir}" \
+    --infobox "${dInfoBox}" \
+    --timer "${timer}" \
+    --webcontent "https://i.gifer.com/PYHc.gif"
+
+  returncode=$?
+
+  case "${returncode}" in
+    0)
+      echo "Service dialog: Quit requested."
+      pkill -f "[D]ialog" 2>/dev/null || true
+      exit 0
+      ;;
+    *)
+      echo "Service dialog: Continuing to next slide."
+      ;;
+  esac
+}
+
+get_services_data() {
+  get_service_statuses() {
+    google_status_pull() {
+      local status_page
+      status_page="$(curl -s https://www.google.com/appsstatus/ || true)"
+
+      if echo "${status_page}" | grep -q 'class="status yellow"' ||
+         echo "${status_page}" | grep -q 'class="status red"'; then
+        google_status="Experiencing issues"
+      else
+        google_status="✅"
+      fi
+    }
+
+    okta_status_pull() {
+      local status_json
+      status_json="$(curl -s https://status.okta.com/api/v2/status.json || true)"
+
+      if echo "${status_json}" | grep -q '"status":"active"'; then
+        okta_status="Experiencing issues"
+      elif echo "${status_json}" | grep -q '"status":"degraded_performance"'; then
+        okta_status="Experiencing issues"
+      else
+        okta_status="✅"
+      fi
+    }
+
+    slack_status_pull() {
+      local page
+      page="$(curl -s https://slack-status.com/ || true)"
+
+      if echo "${page}" | grep -q "Some users may be having trouble sending messages"; then
+        slack_status="Experiencing trouble sending messages"
+      elif echo "${page}" | grep -q "Some users may be having trouble sending files"; then
+        slack_status="Experiencing trouble sending files"
+      elif echo "${page}" | grep -q "Some users may be having trouble loading threads"; then
+        slack_status="Experiencing trouble loading threads"
+      else
+        slack_status="✅"
+      fi
+    }
+
+    zoom_status_pull() {
+      local status_json incidents
+      status_json="$(curl -s https://api.zoom.us/v2/metrics/status || true)"
+      incidents="$(echo "${status_json}" | jq -r '.incidents | length' 2>/dev/null || echo 0)"
+
+      if [[ "${incidents}" -gt 0 ]]; then
+        zoom_status="Experiencing ${incidents}"
+      else
+        zoom_status="✅"
+      fi
+    }
+
+    atlassian_status_pull() {
+      local status_json incidents
+      status_json="$(curl -s https://api.status.atlassian.com/1.0/status || true)"
+      incidents="$(echo "${status_json}" | jq -r '.incidents | length' 2>/dev/null || echo 0)"
+
+      if [[ "${incidents}" -gt 0 ]]; then
+        atlassian_status="Experiencing ${incidents}"
+      else
+        atlassian_status="✅"
+      fi
+    }
+
+    google_status_pull
+    okta_status_pull
+    slack_status_pull
+    zoom_status_pull
+    atlassian_status_pull
+  }
+
+  get_site_statuses() {
+    check_status() {
+      local url="$1"
+      local response
+
+      response="$(curl -s "${url}" || true)"
+
+      if echo "${response}" | grep -q "is UP"; then
+        echo "✅"
+      elif echo "${response}" | grep -q "is DOWN"; then
+        echo "DOWN"
+      else
+        echo "Unknown"
+      fi
+    }
+
+    status_google="$(check_status "https://www.isitdownrightnow.com/google.com.html")"
+    status_okta="$(check_status "https://www.isitdownrightnow.com/okta.com.html")"
+    status_slack="$(check_status "https://www.isitdownrightnow.com/slack.com.html")"
+    status_atlassian="$(check_status "https://www.isitdownrightnow.com/atlassian.com.html")"
+    status_zoom="$(check_status "https://www.isitdownrightnow.com/zoom.us.html")"
+    status_side="$(check_status "https://www.isitdownrightnow.com/side.com.html")"
+  }
+
+  get_service_statuses
+  get_site_statuses
+}
+
+#######################################
+# Caltrain data + dialog
+#######################################
+
+get_caltrain_data() {
+  echo "Caltrain countdown: ${caltrain_api_countdown}"
+
+  if (( caltrain_api_countdown == 0 || caltrain_api_countdown == 4 )); then
+    if [[ -z "${caltrain_api_key}" ]]; then
+      echo "Caltrain API key missing; skipping fetch."
+    else
+      local url response
+      url="http://api.511.org/transit/servicealerts?api_key=${caltrain_api_key}&agency=CT"
+      response="$(curl -s "${url}" || true)"
+
+      printf '%s' "${response}" | pbcopy
+
+      cleaned_up_text="$(
+        gemini-cli prompt \
+          "Please clean up the following text and organize it into a bullet point list with each item on its own line. Remove non-English and weekday-localized noise. Text: $(pbpaste)" \
+          --key "${gemini_key}"
+      )"
+
+      caltrain_api_countdown=3
+      caltrain_api_pull_time="$(date +"%m-%d-%Y %H:%M:%S")"
+    fi
+  fi
+
+  if [[ -n "${cleaned_up_text:-}" ]]; then
+    msg_font="name=Arial-MT,size=18,colour=#FF0000"
+  else
+    msg_font="name=Arial-MT,size=18"
+  fi
+
+  (( caltrain_api_countdown-- ))
+}
+
+caltrain_dialog() {
+  local api_label dTitle dMessage dButton1 timer dIconDir dBackDir dInfoBox returncode
+
+  if (( caltrain_api_countdown == 0 )); then
+    api_label="Running now!"
+  else
+    api_label="${caltrain_api_countdown} left."
+  fi
+
+  sleep 2
+
+  dTitle="Caltrain – Live Transit Times (San Francisco)"
+  dMessage=$(
+    cat <<EOF
+**Next live status update in:** ${api_label} **Last live update:** ${caltrain_api_pull_time}
+
+Caltrain – Any delays will be posted here:
+**${cleaned_up_text:-No current alerts available.}**
+
+
+San Francisco Schedule
+EOF
+  )
+
+  timer=10
+  dButton1="Quit"
+  dIconDir="${dialogIconDir}"
+  dBackDir="${dialogBackGroundDir}"
+  dInfoBox="__Welcome to Side!__\n\n__580 4th St, San Francisco, CA__\n\n(415) 525-4913\n\n__Need Help?__\nhelpdesk@side.com"
+
+  "${dialog_bin}" \
+    --title "${dTitle}" \
+    --titlefont "${dialogTitleFont}" \
+    --message "${dMessage}" \
+    --messagefont "${msg_font}" \
+    --icon "${dIconDir}" \
+    --iconsize 120 \
+    --button1text "${dButton1}" \
+    --height 100% \
+    --width 100% \
+    --background "${dBackDir}" \
+    --infobox "${dInfoBox}" \
+    --timer "${timer}" \
+    --webcontent "https://www.caltrain.com/station/sanfrancisco"
+
+  returncode=$?
+
+  case "${returncode}" in
+    0)
+      echo "Caltrain dialog: Quit requested."
+      pkill -f "[D]ialog" 2>/dev/null || true
+      exit 0
+      ;;
+    *)
+      echo "Caltrain dialog: Continuing to next slide."
+      ;;
+  esac
+}
+
+#######################################
+# BART data + dialog
+#######################################
+
+bart_dialog() {
+  local timer dTitle dMessage dButton1 dIconDir dBackDir dInfoBox returncode bart_api_label
+
+  if (( bart_api_countdown == 0 )); then
+    bart_api_label="Running now!"
+  else
+    bart_api_label="${bart_api_countdown} left."
+  fi
+
+  dTitle="BART – Live Transit Times (Civic Center)"
+  dMessage=$(
+    cat <<EOF
+**Next live status update in:** ${bart_api_label} **Last live update:** ${bart_api_pull_time}
+
+BART current status – any delays will be posted here:
+${bart_status:-No current delays}
+
+Civic Center schedule:
+**${live_schedule_times:-No live schedule available.}**
+EOF
+  )
+
+  dButton1="Quit"
+  timer="${1:-${dialogTimer}}"
+  dIconDir="${dialogIconDir}"
+  dBackDir="${dialogBackGroundDir}"
+  dInfoBox="__Welcome to Side!__\n\n__580 4th St, San Francisco, CA__\n\n(415) 525-4913\n\n__Need Help?__\nhelpdesk@side.com"
+
+  "${dialog_bin}" \
+    --title "${dTitle}" \
+    --titlefont "${dialogTitleFont}" \
+    --message "${dMessage}" \
+    --messagefont "${msg_font}" \
+    --icon "${dIconDir}" \
+    --iconsize 120 \
+    --button1text "${dButton1}" \
+    --height 50% \
+    --width 50% \
+    --background "${dBackDir}" \
+    --infobox "${dInfoBox}" \
+    --timer "${timer}" \
+    --webcontent "https://www.bart.gov/schedules/eta/CIVC"
+
+  returncode=$?
+
+  case "${returncode}" in
+    0)
+      echo "BART dialog: Quit requested."
+      pkill -f "[D]ialog" 2>/dev/null || true
+      exit 0
+      ;;
+    *)
+      echo "BART dialog: Continuing to next slide."
+      ;;
+  esac
+}
+
+get_bart_data() {
+  get_bart_status() {
+    local bsa_url bsa_response
+    bsa_url="https://api.bart.gov/api/bsa.aspx?cmd=bsa&key=${BART_API_KEY}&json=y"
+    bsa_response="$(curl -s "${bsa_url}" || true)"
+
+    bart_status="$(echo "${bsa_response}" | sed -n 's/.*"description":{"#cdata-section":"\([^"]*\)"}.*/\1/p')"
+
+    if [[ -n "${bart_status}" ]]; then
+      msg_font="name=Arial-MT,size=18,colour=#FF0000"
+    else
+      msg_font="name=Arial-MT,size=15"
+      bart_status="No current delays"
+    fi
+  }
+
+  get_station_schedule() {
+    local api_url response
+
+    api_url="http://api.bart.gov/api/etd.aspx?cmd=etd&orig=CIVC&json=y&key=${BART_API_KEY}"
+    response="$(curl -s -L "${api_url}" || true)"
+
+    if echo "${response}" | jq -e '.root.station[0].etd' >/dev/null 2>&1; then
+      local get_times
+      get_times="$(
+        echo "${response}" | jq -r '
+          .root.station[0].etd[] |
+          if .estimate[0].minutes == "Leaving" then
+            "\(.destination): Leaving"
+          else
+            "\(.destination): \(.estimate[0].minutes) min"
+          end
+        '
+      )"
+
+      live_schedule_times="${get_times}"
+    else
+      live_schedule_times="Error: Unable to pull live data. Please refer to the website for the current schedule."
+    fi
+  }
+
+  echo "BART countdown: ${bart_api_countdown}"
+
+  if (( bart_api_countdown == 0 || bart_api_countdown == 4 )); then
+    get_bart_status
+    get_station_schedule
+
+    bart_api_countdown=3
+    bart_api_pull_time="$(date +"%m-%d-%Y %H:%M:%S")"
+  fi
+
+  (( bart_api_countdown-- ))
+}
+
+#######################################
+# Driving / traffic data + dialog
+#######################################
+
+driving_traffic_map_dialog() {
+  local dTitle dMessage dButton1 timer dIconDir dBackDir dInfoBox returncode
+
+  dTitle="Live Traffic – Drive Time Estimates from Side SF Office"
+  dMessage="Map powered by Google. ETAs powered by Apple Maps.\n\nThe left panel shows live estimated driving times from 580 4th St to downtown locations."
+
+  dButton1="Quit"
+  timer="${dialogTimer}"
+  dIconDir="${dialogIconDir}"
+  dBackDir="${dialogBackGroundDir}"
+  dInfoBox=$(
+    cat <<EOF
+__Welcome to Side!__
+
+__580 4th St, San Francisco, CA__
+
+(415) 525-4913
+
+__Need Help?__
+[helpdesk@side.com](${dialogHDURL})
+
+- - - - - - - - - 
+
+__🚗 Driving To:__
+
+**Berkeley:** ${Berkeley_time}
+**Fremont:** ${Fremont_time}
+**Morgan Hill:** ${MorganHill_time}
+**Oakland:** ${Oakland_time}
+**Palo Alto:** ${PaloAlto_time}
+**Pier 39:** ${Pier39_time}
+**San Jose:** ${SanJose_time}
+**Walnut Creek:** ${WalnutCreek_time}
+
+- - - - - - - - - 
+
+__✈️ Airports:__
+
+**Oakland Intl:** ${OAK_time}
+**San Francisco Intl:** ${SFO_time}
+**San Jose Intl:** ${SJC_time}
+EOF
+  )
+
+  "${dialog_bin}" \
+    --title "${dTitle}" \
+    --titlefont "${dialogTitleFont}" \
+    --message "${dMessage}" \
+    --messagefont "name=Arial-MT,size=13" \
+    --icon "${dIconDir}" \
+    --iconsize 120 \
+    --button1text "${dButton1}" \
+    --height 100% \
+    --width 100% \
+    --background "${dBackDir}" \
+    --infobox "${dInfoBox}" \
+    --timer "${timer}" \
+    --webcontent "https://www.google.com/maps/@37.6139506,-122.4261246,10z/data=!5m1!1e1?entry=ttu"
+
+  returncode=$?
+
+  case "${returncode}" in
+    0)
+      echo "Driving dialog: Quit requested."
+      pkill -f "[D]ialog" 2>/dev/null || true
+      exit 0
+      ;;
+    *)
+      echo "Driving dialog: Continuing to next slide."
+      ;;
+  esac
+}
+
+get_driving_traffic_data() {
+  echo "Fetching driving-time data via Shortcuts..."
+
+  get_travel_time() {
+    local shortcut_name="$1"
+    osascript <<EOF
+      tell application "Shortcuts Events"
+        set shortcutResult to run shortcut "${shortcut_name}"
+      end tell
+
+      set resultText to ""
+      repeat with anItem in shortcutResult
+        set resultText to resultText & anItem & " "
+      end repeat
+      resultText
+EOF
+  }
+
+  Pier39_time="$(get_travel_time "Travel Time Pier 39")"
+  Oakland_time="$(get_travel_time "Travel Time Oakland")"
+  Berkeley_time="$(get_travel_time "Travel Time Berkeley")"
+  WalnutCreek_time="$(get_travel_time "Travel Time Walnut Creek")"
+  Fremont_time="$(get_travel_time "Travel Time Fremont")"
+  SanJose_time="$(get_travel_time "Travel Time San Jose")"
+  PaloAlto_time="$(get_travel_time "Travel Time Palo Alto")"
+  SFO_time="$(get_travel_time "Travel Time SFO")"
+  OAK_time="$(get_travel_time "Travel Time OAK")"
+  SJC_time="$(get_travel_time "Travel Time SJC")"
+  MorganHill_time="$(get_travel_time "Travel Time Morgan Hill")"
+
+  echo "Estimated drive times from Side SF:"
+  echo "  Pier 39:       ${Pier39_time}"
+  echo "  Oakland:       ${Oakland_time}"
+  echo "  Berkeley:      ${Berkeley_time}"
+  echo "  Walnut Creek:  ${WalnutCreek_time}"
+  echo "  Fremont:       ${Fremont_time}"
+  echo "  San Jose:      ${SanJose_time}"
+  echo "  Palo Alto:     ${PaloAlto_time}"
+  echo "  SFO:           ${SFO_time}"
+  echo "  OAK:           ${OAK_time}"
+  echo "  SJC:           ${SJC_time}"
+  echo "  Morgan Hill:   ${MorganHill_time}"
+}
+
+#######################################
+# Startup / loading dialog
+#######################################
+
+startup_dialog() {
+  local dTitle dMessage dButton1 dIconDir dBackDir dInfoBox returncode
+
+  dTitle="Loading data… please wait"
+  dMessage="Downloading the latest live information. This may take a moment."
+  dButton1="Quit"
+  dIconDir="${dialogIconDir}"
+  dBackDir="${dialogBackGroundDir}"
+  dInfoBox="__Welcome to Side!__\n\n__580 4th St, San Francisco, CA__\n\n(415) 525-4913\n\n__Need Help?__\nhelpdesk@side.com"
+
+  "${dialog_bin}" \
+    --title "${dTitle}" \
+    --titlefont "${dialogTitleFont}" \
+    --message "${dMessage}" \
+    --messagefont "name=Arial-MT,size=16" \
+    --icon "${dIconDir}" \
+    --iconsize 120 \
+    --button1text "${dButton1}" \
+    --height 100% \
+    --width 100% \
+    --background "${dBackDir}" \
+    --infobox "${dInfoBox}" \
+    --webcontent "https://cdn.dribbble.com/users/5436944/screenshots/14793980/media/eb75f36d10810389e8c0ddefb7423e34.gif"
+
+  returncode=$?
+
+  case "${returncode}" in
+    0)
+      echo "Startup dialog: Quit requested."
+      pkill -f "[D]ialog" 2>/dev/null || true
+      exit 0
+      ;;
+    *)
+      echo "Startup dialog: Continuing into main loop."
+      ;;
+  esac
+}
+
+#######################################
+# Main
+#######################################
+
+set_master_variables
+
+echo "MAIN: Ensuring swiftDialog is installed."
+install_dialog
+
+echo "MAIN: Initial load – showing startup dialog and priming driving data."
+startup_dialog & get_driving_traffic_data
+wait
+
+while true; do
+  echo "MAIN: Driving slide + BART data."
+  driving_traffic_map_dialog & get_bart_data
+  wait
+
+  echo "MAIN: BART slide + Caltrain data."
+  bart_dialog "${dialogTimer}" & get_caltrain_data
+  wait
+
+  echo "MAIN: Caltrain slide + services data."
+  caltrain_dialog & get_services_data
+  wait
+
+  echo "MAIN: Services slide + driving data."
+  services_dialog & get_driving_traffic_data
+  wait
+
+  echo "MAIN: Loop complete – restarting sequence."
+done
+
+
+
+
+-----OG
 #!/bin/bash
 ## Hackathon 2024
 # This script leverages swiftDialog for the dialog and several APIs to pull live data.
