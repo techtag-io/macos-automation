@@ -1,569 +1,560 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Script Name: Guided macOS Upgrade with swiftDialog
+# Description:
+#   - Prompts user to download a specific macOS installer (InstallAssistant.pkg)
+#   - Shows a progress-style dialog while downloading and expanding the app
+#   - If the installer already exists, prompts directly to install
+#   - Handles Apple Silicon vs Intel, with password verification for startosinstall
+#   - Uses swiftDialog for all user-facing alerts and blocking UI
+#
 
-#Show alert - clicking proceed will start the download of macOS, once done you will get another alert to install macOS - at this point the screen will be blocked so that the install is not interrupted
+set -euo pipefail
 
-#alert1 - click proceed to download
-#alert2 - show status bar while downloading
-## confirm download
-#alert3 - click install to install / dismiss to install later
-##only if install
-#alert 4 - block screen and install
+#######################################
+# Parameters and globals
+#######################################
 
+# Jamf parameters
+macOSVersion="${4:-13.4.1}"        # e.g. 13.4.1
+dlmacOSName="${5:-Ventura}"        # e.g. Ventura
 
+# Device info
+currentOSVersion="$(sw_vers -productVersion)"
+macSerial="$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')"
 
-
-installSwiftDialog () {
-	
-    wallpaperDir="/Library/Application Support/wallpaper/"
-    wallpaperImg="desktopwallpaper.jpg"
-    wallpaperPKGDir="/Library/Application Support/Jamf/Waiting Room/wallpaper.pkg"
-    
-    if [ -f "$wallpaperDir$wallpaperImg" ]; then
-    echo "Wallpaper found, skipping install"
-    else
-    echo "Installing wallpaper"
-    sudo /usr/sbin/installer -pkg "$wallpaperPKGDir" -target /
-    fi
-	
-	
-	
-	
-	dialog_bin="/usr/local/bin/dialog"
-	dialog_download_url="https://github.com/bartreardon/swiftDialog/releases/download/v2.2.1/dialog-2.2.1-4591.pkg"
-	dialogDir='/usr/local/'
-	swiftDialogPKG="swiftDialog.pkg"
-	dialogAppDir="/Library/Application Support/Dialog/Dialog.app"
-
-	if [ -f $dialog_bin ]; then
-		echo "Dialog app found, skipping install..."
-	else 
-		echo "Dialog app not found, downloading and installing dialog"
-	    ##Download swiftDialog
-	    sudo /usr/bin/curl -L "$dialog_download_url" -o "$dialogDir$swiftDialogPKG"
-	
-	    ##Installing Dialog
-	    sudo /usr/sbin/installer -pkg "$dialogDir$swiftDialogPKG" -target /
-		sleep 5
-	
-		#Cleanup
-		sudo rm -r "$dialogDir$swiftDialogPKG"
-	fi
-	
-
-}
-
-
-
-
-
-##Parameters
-macOSVersion="$4" #13.4.1
-dlmacOSName="$5" #Ventura
-
-##Device info
-currentOSVersion=$(sw_vers -productVersion)
-macSerial=$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')
-
-#macOS InstallAssistant PKG - this will contain and exract Install macOS Ventura.app
+# macOS InstallAssistant (downloads Install macOS ${dlmacOSName}.app)
 macOSURL='https://swcdn.apple.com/content/downloads/63/49/032-84910-A_3SSTBN1HDA/h89vitwfbzt54jcbwpfwkmrn12smedicny/InstallAssistant.pkg'
 macOSDir="/usr/local/"
 macOSPKG="InstallAssistant.pkg"
 
-#Dialog
+# swiftDialog / branding
+dialog_bin="/usr/local/bin/dialog"
+dialog_download_url="https://github.com/bartreardon/swiftDialog/releases/download/v2.2.1/dialog-2.2.1-4591.pkg"
+dialogDir="/usr/local/"
+swiftDialogPKG="swiftDialog.pkg"
+dialogAppDir="/Library/Application Support/Dialog/Dialog.app"
+
 dialogIconDir="/Library/Application Support/SideIT/ATTIcon.png"
 dialogBackGroundDir="/Library/Application Support/wallpaper/desktopwallpaper.jpg"
 dialogSlackURL="https://app.slack.com/client/T0XD2CN2V/CNW9PA7NG"
 dialogHDURL="https://sideinc.freshservice.com/support/catalog/items/131"
 dialogTitleFont="name=Arial-MT,colour=#CE87C1,size=30"
 
-#install Dialog
-installSwiftDialog
+wallpaperDir="/Library/Application Support/wallpaper/"
+wallpaperImg="desktopwallpaper.jpg"
+wallpaperPKGDir="/Library/Application Support/Jamf/Waiting Room/wallpaper.pkg"
 
-#====================================
+# ephemeral state
+userApprovedConfirmDir="/tmp/macOS_update_pass.txt"
+currentUser=""
+postPoneWindowSelected=""
+userPass=""
 
+#######################################
+# Helpers
+#######################################
 
-
-
-#====================================
-
-
-installAlert () {
-	
-dTitle="Installing macOS $macOSVersion... Please wait"
-dMessage="macOS $macOSVersion is being installed.
-
-This process could take up to 45 minutes.\n Once done, the device will restart on its own
-at which point the update will be complete.
-
-PLEASE MAKE SURE THE DEVICE IS CONNECTED TO A POWERSOURCE SO IT IS NOT INTERRUPTED!
-
-Contact helpdesk@side.com or #it-support in Slack with any questions.
-Thank you! \n
-Side IT Helpdesk"
-dIconDir="$dialogIconDir"
-web="https://www.cultofmac.com/wp-content/uploads/2014/10/slinky_me_54467c11ddf8b.gif"
-timer=2700 #60*45=2700
-caffeineTimer=3600 #60*60=3600 
-dInfoBox="__macOS Version__  
-$currentOSVersion\n\n   
-__Device Serial__
-$macSerial\n\n
-__Slack__  
-[#it-support]($dialogSlackURL)\n\n
-__Email__  
-[helpdesk@side.com]($dialogHDURL)"
-
-
-			caffeinate -i -s -d -t $caffeineTimer & updateNowAlert=$(${dialog_bin} \
-			    --title "$dTitle" \
-				--titlefont "$dialogTitleFont" \
-			    --message "$dMessage" \
-				--messagefont "name=Arial-MT,size=30" \
-			    --icon "$dIconDir" \
-				--iconsize 250 \
-				--helpmessage "$dHelp" \
-				--helptitle "TITLE" \
-				--webcontent "$web" \
-				--blurscreen \
-			    --infobox "$dInfoBox" \
-				--background "$dialogBackGroundDir" \
-				--timer "$timer"
-	
-			)
+safe_rm() {
+  local path="$1"
+  [[ -e "${path}" ]] && sudo rm -rf "${path}"
 }
 
+get_logged_in_user() {
+  currentUser="$(scutil <<< 'show State:/Users/ConsoleUser' | awk '/Name :/ { print $3 }')"
+  echo "Logged in user: ${currentUser}"
+}
 
-appleSiliconInstall () {
+#######################################
+# swiftDialog installation
+#######################################
 
-	echo "apple silicon"
-	passCheck=" "
+installSwiftDialog() {
+  # Wallpaper
+  if [[ -f "${wallpaperDir}${wallpaperImg}" ]]; then
+    echo "Wallpaper found; skipping wallpaper install."
+  else
+    echo "Installing wallpaper package…"
+    sudo /usr/sbin/installer -pkg "${wallpaperPKGDir}" -target /
+  fi
 
-	until [ $passCheck == "PASSED" ];
-	do
-	
-			if [ "$passCheck" != "FAILED" ]; then
-	dTitle="The update will happen AFTER $postPoneWindowSelected"
-	userPasswordNeeded="Apple requires the user to authenticate with the computer password to update macOS
-	Please confirm your computer password to confirm the update schedule."
-	dialogTitleFont="$dialogTitleFont"
+  # swiftDialog
+  if [[ -x "${dialog_bin}" ]]; then
+    echo "swiftDialog found; skipping installation."
+  else
+    echo "swiftDialog not found; downloading and installing…"
+    sudo /usr/bin/curl -L "${dialog_download_url}" -o "${dialogDir}${swiftDialogPKG}"
+    sudo /usr/sbin/installer -pkg "${dialogDir}${swiftDialogPKG}" -target /
+    sleep 5
+    safe_rm "${dialogDir}${swiftDialogPKG}"
+  fi
+}
 
-			else #if password failed
+#######################################
+# Blocking install alert (during startosinstall)
+#######################################
 
-	dTitle="INCORRECT PASSWORD! TRY AGAIN..."
-	userPasswordNeeded="Apple requires the user to authenticate with the computer password to update macOS
-	Please confirm your computer password to confirm the update schedule.\n\n_***INCORRECT PASSWORD, TRY AGAIN...***_"
-	dialogTitleFont="name=Arial-MT,colour=#FF0000,size=30"
-			fi
+installAlert() {
+  local dTitle dMessage dIconDir web timer caffeineTimer dInfoBox
 
+  dTitle="Installing macOS ${macOSVersion}… Please wait"
+  dMessage=$(
+    cat <<EOF
+macOS ${macOSVersion} is being installed.
 
+This process could take up to 45 minutes. Once done, the device will restart on its own
+at which point the update will be complete.
 
-		####==============================
-		#Dialog Parameters
-dMessage="Your macOS Update to macOS $macOSVersion is set to take place after $postPoneWindowSelected.
-You are still able to install the update yourself before $postPoneWindowSelected by going to /Applications/ and running
-\"Install macOS $dlmacOSName\"
+PLEASE MAKE SURE THE DEVICE IS CONNECTED TO A POWER SOURCE SO IT IS NOT INTERRUPTED!
+
+Contact helpdesk@side.com or #it-support in Slack with any questions.
+Thank you!
+Side IT Helpdesk
+EOF
+  )
+  dIconDir="${dialogIconDir}"
+  web="https://www.cultofmac.com/wp-content/uploads/2014/10/slinky_me_54467c11ddf8b.gif"
+  timer=$((60 * 45))          # 2700
+  caffeineTimer=$((60 * 60))  # 3600
+
+  dInfoBox=$(
+    cat <<EOF
+__macOS Version__
+${currentOSVersion}
+
+__Device Serial__
+${macSerial}
+
+__Slack__
+[#it-support](${dialogSlackURL})
+
+__Email__
+[helpdesk@side.com](${dialogHDURL})
+EOF
+  )
+
+  caffeinate -i -s -d -t "${caffeineTimer}" &
+
+  "${dialog_bin}" \
+    --title "${dTitle}" \
+    --titlefont "${dialogTitleFont}" \
+    --message "${dMessage}" \
+    --messagefont "name=Arial-MT,size=30" \
+    --icon "${dIconDir}" \
+    --iconsize 250 \
+    --webcontent "${web}" \
+    --blurscreen \
+    --infobox "${dInfoBox}" \
+    --background "${dialogBackGroundDir}" \
+    --timer "${timer}"
+}
+
+#######################################
+# Apple Silicon install (password‑gated)
+#######################################
+
+appleSiliconInstall() {
+  echo "Apple Silicon flow."
+  get_logged_in_user
+
+  local passCheck="FAILED"
+
+  while [[ "${passCheck}" != "PASSED" ]]; do
+    local dTitle userPasswordNeeded dMessage dButton1 dHelp dInfoBox dialog_output resultCode
+
+    if [[ "${passCheck}" != "FAILED" ]]; then
+      dTitle="The update will happen after ${postPoneWindowSelected}"
+      userPasswordNeeded="Apple requires the user to authenticate with the computer password to update macOS.
+Please confirm your computer password to confirm the update schedule."
+    else
+      dTitle="INCORRECT PASSWORD! TRY AGAIN…"
+      userPasswordNeeded="Apple requires the user to authenticate with the computer password to update macOS.
+Please confirm your computer password to confirm the update schedule.
+
+_***INCORRECT PASSWORD, TRY AGAIN…***_"
+      dialogTitleFont="name=Arial-MT,colour=#FF0000,size=30"
+    fi
+
+    dMessage=$(
+      cat <<EOF
+Your macOS update to macOS ${macOSVersion} is set to take place after ${postPoneWindowSelected}.
+You are still able to install the update yourself before ${postPoneWindowSelected} by going to /Applications and running
+"Install macOS ${dlmacOSName}".
 
 PLEASE NOTE THAT FOR THE UPDATE TO BE SUCCESSFUL, YOU NEED TO KEEP THE DEVICE:
 1. TURNED ON
-2. CONNECTED TO A POWERSOURCE
+2. CONNECTED TO A POWER SOURCE
 3. CONNECTED TO THE INTERNET
 
-IF ANY OF THE ABOVE ARE MISSING THE UPDATE WILL BEGIN THE NEXT TIME
+IF ANY OF THE ABOVE ARE MISSING, THE UPDATE WILL BEGIN THE NEXT TIME
 THE DEVICE IS ONLINE, WHICH MAY CAUSE DISRUPTION.
 
-$userPasswordNeeded
+${userPasswordNeeded}
 
+Contact helpdesk@side.com or #it-support in Slack with any questions.
+EOF
+    )
+    dButton1="I Understand"
+    dHelp="This notification is launched automatically by Side IT Helpdesk.\nPlease contact helpdesk@side.com or #it-support in Slack with any questions or concerns."
+    dInfoBox=$(
+      cat <<EOF
+__Current macOS__
+${currentOSVersion}
 
-Contact helpdesk@side.com or #it-support in Slack with any questions."
-dButton1="I Understand"
-dPostponeTitle="Postpone until"
-dIconDir="$dialogIconDir"
-dBackDir="$dialogBackGroundDir"
-dHelp="This notification is launched automatically by Side IT Helpdesk.\n
-Please contact helpdesk@side.com or #it-support in Slack with any questions or concerns."
-dInfoBox="__Current macOS:__ $currentOSVersion\n\n
-__Update To:__
-$macOSVersion\n\n
+__Update To__
+${macOSVersion}
+
 __Device Serial__
-$macSerial\n\n
-__Slack__  
-[#it-support]($dialogSlackURL)\n\n
-__Support Ticket__  
-[helpdesk@side.com]($dialogHDURL)"
+${macSerial}
 
-	
-			echo "apple silicon"
-			postPoneConfirm=$(${dialog_bin} \
-			    --title "$dTitle" \
-				--titlefont "$dialogTitleFont" \
-			    --message "$dMessage" \
-				--messagefont "name=Arial-MT,size=30" \
-			    --icon "$dIconDir" \
-				--iconsize 120 \
-			    --button1text "$dButton1" \
-				--helpmessage "$dHelp" \
-				--helptitle "TITLE" \
-				--textfield "Password",required,secure \
-				--big \
-				--infobox "$dInfoBox" \
-				--background "$dBackDir" 
-				#--blurscreen true
-			)
-	
-	
-	
-		
-	
+__Slack__
+[#it-support](${dialogSlackURL})
 
-	echo "Confirm: "$postPoneConfirm
-	#echo ${postPoneConfirm:11}
-	userPass=${postPoneConfirm:11}
+__Support Ticket__
+[helpdesk@side.com](${dialogHDURL})
+EOF
+    )
 
-	#use echo below to confirm - not printing for security
-	#echo userPass is $userPass
-	
-	dscl . authonly "$currentUser" "$userPass" &> /dev/null; resultCode=$?
-		if [ "$resultCode" -eq 0 ];then
-	    	echo "Password Check: PASSED"
-			passCheck="PASSED"
-	    	# DO THE REST OF YOUR ACTIONS....
-	
-			#Put password in temp file for update
-			echo $userPass > $userApprovedConfirDir
+    dialog_output="$(
+      "${dialog_bin}" \
+        --title "${dTitle}" \
+        --titlefont "${dialogTitleFont}" \
+        --message "${dMessage}" \
+        --messagefont "name=Arial-MT,size=30" \
+        --icon "${dialogIconDir}" \
+        --iconsize 120 \
+        --button1text "${dButton1}" \
+        --helpmessage "${dHelp}" \
+        --helptitle "TITLE" \
+        --textfield "Password",required,secure \
+        --big \
+        --infobox "${dInfoBox}" \
+        --background "${dialogBackGroundDir}"
+    )"
 
-		else
-	    	# Prompt for User Password
-	    	echo "Password Check: WRONG PASSWORD"
-	    	#wrongUserPassword
-			passCheck="FAILED"
-		fi
+    echo "Confirm output: ${dialog_output}"
 
+    userPass="${dialog_output#Password : }"
 
-	done
+    # Validate password
+    if dscl . authonly "${currentUser}" "${userPass}" &>/dev/null; then
+      echo "Password Check: PASSED"
+      passCheck="PASSED"
+      printf '%s\n' "${userPass}" >"${userApprovedConfirmDir}"
+    else
+      echo "Password Check: FAILED"
+      passCheck="FAILED"
+    fi
+  done
 
+  echo "Starting startosinstall for Apple Silicon…"
+  printf '%s\n' "${userPass}" | \
+    "/Applications/Install macOS ${dlmacOSName}.app/Contents/Resources/startosinstall" \
+      --agreetolicense \
+      --nointeraction \
+      --user "${currentUser}" \
+      --stdinpass &
 
-
-	echo $userPass | /Applications/Install\ macOS\ Ventura.app/Contents/Resources/startosinstall --agreetolicense --nointeraction --user "$currentUser" --stdinpass & installAlert
-	killall Dialog
+  installAlert
+  killall Dialog 2>/dev/null || true
 }
 
-intelInstall () {
+#######################################
+# Intel install
+#######################################
 
-	/Applications/Install\ macOS\ $dlmacOSName.app/Contents/Resources/startosinstall --agreetolicense --nointeraction --user "$currentUser" --stdinpass & installAlert
-	killall Dialog
+intelInstall() {
+  echo "Intel flow."
+  get_logged_in_user
 
+  printf '%s\n' "${userPass:-}" | \
+    "/Applications/Install macOS ${dlmacOSName}.app/Contents/Resources/startosinstall" \
+      --agreetolicense \
+      --nointeraction \
+      --user "${currentUser}" \
+      --stdinpass &
+
+  installAlert
+  killall Dialog 2>/dev/null || true
 }
 
+#######################################
+# Silicon type check and routing
+#######################################
 
-
-
-
-#====================================
-#CHECK Silicon Type
-
-siliconCheck () {
-if [[ `uname -m` == 'arm64' ]]; then
-  echo "Sicilone: M1"
-  siliconType="M1"
-  
-  #Get logged in user for password and install
-  echo Getting Logged In User
-  currentUser=$( echo "show State:/Users/ConsoleUser" | scutil | awk '/Name :/ { print $3 }' )
-  echo "Logged in user: $currentUser"
-  
-  appleSiliconInstall
-  
-  
-else
-	echo "Silicone: Intel"
-	siliconType="intel"
-	intelInstall
-	
-	
-fi
+siliconCheck() {
+  if [[ "$(uname -m)" == "arm64" ]]; then
+    echo "Silicon type: Apple Silicon (M1/M2)."
+    appleSiliconInstall
+  else
+    echo "Silicon type: Intel."
+    intelInstall
+  fi
 }
 
-################ CHECK Silicon DONE
-#====================================
-#====================================
+#######################################
+# Ask to install (installer already present)
+#######################################
 
+askToInstall() {
+  local dTitle dMessage dButton1 dButton2 dHelp dInfoBox dialog_output returncode
 
-#====================================
-## Ask to install
+  dTitle="Side IT Alert: macOS Install"
+  dMessage=$(
+    cat <<EOF
+macOS ${macOSVersion} has successfully downloaded and is ready to be installed.
 
-askToInstall () {
-
-dTitle="Side IT Alert: macOS Install"
-dMessage="macOS $macOSVersion has successfully downloaded and is ready to be installed.
-	
-PLEASE NOTE - Clicking \"Install\" will automatically block your screen and start the install.\n
+PLEASE NOTE – Clicking "Install" will automatically block your screen and start the install.
 YOU CANNOT USE YOUR COMPUTER DURING THIS TIME!
-	
-If you would rather install it later, simply \"Exit\" this alert.
 
-Contact helpdesk@side.com or #it-support in Slack with any questions.\n
-Thank you!\n 
--Side IT."
-dButton1="Install"
-dButton2="Exit"
-dIconDir="$dialogIconDir"
-dBackDir="$dialogBackGroundDir"
-dHelp="This notification is launched automatically by Side IT Helpdesk.\n
-Please contact helpdesk@side.com or #it-support in Slack with any questions or concerns."
-dInfoBox="__Current macOS:__ $currentOSVersion\n\n
-__Update To:__
-$macOSVersion\n\n
-__Serial:__
-$macSerial\n\n
-__Slack__  
-[#it-support]($dialogSlackURL)\n\n
-__Support Ticket__  
-[helpdesk@side.com]($dialogHDURL)"
+If you would rather install it later, simply click "Exit".
 
+Contact helpdesk@side.com or #it-support in Slack with any questions.
+Thank you!
+– Side IT.
+EOF
+  )
+  dButton1="Install"
+  dButton2="Exit"
+  dHelp="This notification is launched automatically by Side IT Helpdesk.\nPlease contact helpdesk@side.com or #it-support in Slack with any questions or concerns."
+  dInfoBox=$(
+    cat <<EOF
+__Current macOS__
+${currentOSVersion}
 
+__Update To__
+${macOSVersion}
 
-		userTimeSelection=$(${dialog_bin} \
-		    --title "$dTitle" \
-			--titlefont "$dialogTitleFont" \
-		    --message "$dMessage" \
-			--messagefont "name=Arial-MT,size=30" \
-		    --icon "$dIconDir" \
-			--iconsize 120 \
-		    --button1text "$dButton1" \
-		    --button2text "$dButton2" \
-			--helpmessage "$dHelp" \
-			--helptitle "TITLE" \
-			--big \
-			--background "$dBackDir" \
-			--infobox "$dInfoBox" \
-			--moveable 
-	
-		)		
-		
+__Serial__
+${macSerial}
 
+__Slack__
+[#it-support](${dialogSlackURL})
 
-		#Button pressed Stuff
-		returncode=$?
+__Support Ticket__
+[helpdesk@side.com](${dialogHDURL})
+EOF
+  )
 
+  dialog_output="$(
+    "${dialog_bin}" \
+      --title "${dTitle}" \
+      --titlefont "${dialogTitleFont}" \
+      --message "${dMessage}" \
+      --messagefont "name=Arial-MT,size=30" \
+      --icon "${dialogIconDir}" \
+      --iconsize 120 \
+      --button1text "${dButton1}" \
+      --button2text "${dButton2}" \
+      --helpmessage "${dHelp}" \
+      --helptitle "TITLE" \
+      --big \
+      --background "${dialogBackGroundDir}" \
+      --infobox "${dInfoBox}" \
+      --moveable
+  )"
 
-		case ${returncode} in
-		    0)  echo "Pressed Button 1: install"
-			siliconCheck
-		
-			exit 0
-		        ;;
+  returncode=$?
 
-		    2)  echo "Pressed Button 2: exit"
-	
-			exit 0
-
-		        ;;
-		
-		    *)  echo "Something else happened. exit code ${returncode}"
-			exit 0
-
-		        ;;
-		esac
-
+  case "${returncode}" in
+    0)
+      echo "User chose Install; running silicon check."
+      siliconCheck
+      exit 0
+      ;;
+    2)
+      echo "User chose Exit; nothing to do."
+      exit 0
+      ;;
+    *)
+      echo "askToInstall dialog exit code ${returncode}; exiting."
+      exit 0
+      ;;
+  esac
 }
 
+#######################################
+# Download macOS and then prompt to install
+#######################################
 
+downloadmacOS() {
+  echo "Downloading InstallAssistant for macOS ${macOSVersion}…"
+  /usr/bin/curl -L "${macOSURL}" -o "${macOSDir}${macOSPKG}"
 
+  echo "Expanding InstallAssistant.pkg to install app…"
+  /usr/sbin/installer -pkg "${macOSDir}${macOSPKG}" -target /
+  sleep 5
 
-#====================================
+  safe_rm "${macOSDir}${macOSPKG}"
+  killall Dialog 2>/dev/null || true
+  sleep 2
 
-
-
-
-
-
-
-###=================================
-#Download and Alert
-
-downloadmacOS () {
-
-	echo Downloading $macOSVersion
-	#downloading InstallAssistant.pkg for Ventura
-	curl -L "$macOSURL" -o "$macOSDir$macOSPKG"
-	
-	#install - extract "Install macOS Ventura.app"
-	/usr/sbin/installer -pkg "$macOSDir$macOSPKG" -target /
-	
-	sleep 5
-	#Cleanup - remove InstallAssistant.pkg
-	sudo rm -rf "$macOSDir$macOSPKG"
-    killall Dialog
-	
-	sleep 2
-	
-
-
-	echo "Verifying macOS Download..."
-	if [ -a /Applications/Install\ macOS\ $dlmacOSName.app ]; then
-		echo "App found... launch alert"
-		askToInstall
-		
-		
-		
-	else
-		echo "App not found... exiting"
-	#	sudo jamf recon -room "macOS Update Fail"
-		exit 
-	fi
-
-
+  echo "Verifying macOS installer app…"
+  if [[ -d "/Applications/Install macOS ${dlmacOSName}.app" ]]; then
+    echo "Installer app found; prompting to install."
+    askToInstall
+  else
+    echo "Installer app not found after download; exiting."
+    # Optionally: sudo jamf recon -room "macOS Update Fail"
+    exit 1
+  fi
 }
 
+downloadmacOSAlert() {
+  local dTitle dMessage dIconDir web timer caffeineTimer dHelp dInfoBox
 
+  dTitle="Side IT Alert: Downloading macOS"
+  dMessage=$(
+    cat <<EOF
+macOS ${macOSVersion} download has begun.
 
+This will take some time. You are free to continue working during this process.
 
-
-downloadmacOSAlert () {
-
-dTitle="Side IT Alert: Downloading macOS"
-dMessage="macOS $macOSVersion download has begun.
-	
-This will take some time. 
-You are free to continue working during this process.
-	
 __DO NOT CLOSE THE SELF SERVICE APP OR IT COULD DISRUPT THE DOWNLOAD.__
 
-Contact helpdesk@side.com or #it-support in Slack with any questions.\n
-Thank you!\n 
--Side IT."
-dIconDir="$dialogIconDir"
-dBackDir="$dialogBackGroundDir"
-web="https://www.cultofmac.com/wp-content/uploads/2014/10/slinky_me_54467c11ddf8b.gif"
-timer=2700 #60*45=2700
-caffeineTimer=3600
-dHelp="This notification is launched automatically by Side IT Helpdesk.\n
-Please contact helpdesk@side.com or #it-support in Slack with any questions or concerns."
-dInfoBox="__Current macOS:__ $currentOSVersion\n\n
-__Update To:__
-$macOSVersion\n\n
-__Serial:__
-$macSerial\n\n
-__Slack__  
-[#it-support]($dialogSlackURL)\n\n
-__Support Ticket__  
-[helpdesk@side.com]($dialogHDURL)"
+Contact helpdesk@side.com or #it-support in Slack with any questions.
+Thank you!
+– Side IT.
+EOF
+  )
+  dIconDir="${dialogIconDir}"
+  web="https://www.cultofmac.com/wp-content/uploads/2014/10/slinky_me_54467c11ddf8b.gif"
+  timer=$((60 * 45))
+  caffeineTimer=$((60 * 60))
+  dHelp="This notification is launched automatically by Side IT Helpdesk.\nPlease contact helpdesk@side.com or #it-support in Slack with any questions or concerns."
+  dInfoBox=$(
+    cat <<EOF
+__Current macOS__
+${currentOSVersion}
 
+__Update To__
+${macOSVersion}
 
+__Serial__
+${macSerial}
 
-		caffeinate -i -s -d -t $caffeineTimer userTimeSelection=$(${dialog_bin} \
-		    --title "$dTitle" \
-			--titlefont "$dialogTitleFont" \
-		    --message "$dMessage" \
-			--messagefont "name=Arial-MT,size=30" \
-		    --icon "$dIconDir" \
-			--iconsize 120 \
-			--helpmessage "$dHelp" \
-			--helptitle "TITLE" \
-			--big \
-			--background "$dBackDir" \
-			--infobox "$dInfoBox" \
-            --webcontent "$web" \
-			--timer "$timer" \
-			--moveable 
+__Slack__
+[#it-support](${dialogSlackURL})
 
-		)	
+__Support Ticket__
+[helpdesk@side.com](${dialogHDURL})
+EOF
+  )
 
+  caffeinate -i -s -d -t "${caffeineTimer}" &
 
+  "${dialog_bin}" \
+    --title "${dTitle}" \
+    --titlefont "${dialogTitleFont}" \
+    --message "${dMessage}" \
+    --messagefont "name=Arial-MT,size=30" \
+    --icon "${dIconDir}" \
+    --iconsize 120 \
+    --helpmessage "${dHelp}" \
+    --helptitle "TITLE" \
+    --big \
+    --background "${dialogBackGroundDir}" \
+    --infobox "${dInfoBox}" \
+    --webcontent "${web}" \
+    --timer "${timer}" \
+    --moveable
 }
 
-###=================================
+#######################################
+# Initial user prompt to download
+#######################################
 
-######## CHECKING FOR macOS Download
+prompt_download() {
+  local dTitle dMessage dButton1 dButton2 dHelp dInfoBox returncode
 
+  dTitle="Side IT Alert: macOS Update"
+  dMessage=$(
+    cat <<EOF
+This policy is for updating macOS to the latest version – macOS ${macOSVersion}.
 
-echo "Verifying macOS Download..."
-if [ -a /Applications/Install\ macOS\ $dlmacOSName.app ]; then
-	echo "App found... launch alert"
-	askToInstall
-	
-	
-	
-else
-	echo "App not found... continuing"
-fi
+The download will NOT automatically install; you must manually trigger the installation.
+The download can take up to 30 minutes to complete depending on your internet bandwidth.
 
+Click "Download" to start the process.
+Click "Dismiss" if you prefer to perform this at a later time.
 
-######## CHECKING FOR macOS Download
+Contact helpdesk@side.com or #it-support in Slack with any questions.
+Thank you!
+– Side IT.
+EOF
+  )
+  dButton1="Download"
+  dButton2="Dismiss"
+  dHelp="This notification is launched automatically by Side IT Helpdesk.\nPlease contact helpdesk@side.com or #it-support in Slack with any questions or concerns."
+  dInfoBox=$(
+    cat <<EOF
+__Current macOS__
+${currentOSVersion}
 
+__Update To__
+${macOSVersion}
 
+__Serial__
+${macSerial}
 
-dTitle="Side IT Alert: macOS Update"
-dMessage="This policy is for updating macOS to the latest version - macOS $macOSVersion 
+__Slack__
+[#it-support](${dialogSlackURL})
 
-The download will NOT automatically install, you must manually trigger the installation. 
-The download can take up to 30 min to complete depending on your internet bandwidth speed.
+__Support Ticket__
+[helpdesk@side.com](${dialogHDURL})
+EOF
+  )
 
-Click \"Download\" to start the process.
-Click \"Dismiss\" if you prefer to perform this at a later time.
+  "${dialog_bin}" \
+    --title "${dTitle}" \
+    --titlefont "${dialogTitleFont}" \
+    --message "${dMessage}" \
+    --messagefont "name=Arial-MT,size=30" \
+    --icon "${dialogIconDir}" \
+    --iconsize 120 \
+    --button1text "${dButton1}" \
+    --button2text "${dButton2}" \
+    --helpmessage "${dHelp}" \
+    --helptitle "TITLE" \
+    --big \
+    --background "${dialogBackGroundDir}" \
+    --infobox "${dInfoBox}" \
+    --moveable
 
-Contact helpdesk@side.com or #it-support in Slack with any questions.\n
-Thank you!\n 
--Side IT."
-dButton1="Download"
-dButton2="Dismiss"
-dIconDir="$dialogIconDir"
-dBackDir="$dialogBackGroundDir"
-dHelp="This notification is launched automatically by Side IT Helpdesk.\n
-Please contact helpdesk@side.com or #it-support in Slack with any questions or concerns."
-dInfoBox="__Current macOS:__ $currentOSVersion\n\n
-__Update To:__
-$macOSVersion\n\n
-__Serial:__
-$macSerial\n\n
-__Slack__  
-[#it-support]($dialogSlackURL)\n\n
-__Support Ticket__  
-[helpdesk@side.com]($dialogHDURL)"
+  returncode=$?
 
+  case "${returncode}" in
+    0)
+      echo "User chose Download; starting download + download alert."
+      downloadmacOS & downloadmacOSAlert
+      exit 0
+      ;;
+    2)
+      echo "User chose Dismiss; exiting."
+      exit 0
+      ;;
+    *)
+      echo "Download prompt exit code ${returncode}; exiting."
+      exit 0
+      ;;
+  esac
+}
 
+#######################################
+# Main
+#######################################
 
-	userTimeSelection=$(${dialog_bin} \
-	    --title "$dTitle" \
-		--titlefont "$dialogTitleFont" \
-	    --message "$dMessage" \
-		--messagefont "name=Arial-MT,size=30" \
-	    --icon "$dIconDir" \
-		--iconsize 120 \
-	    --button1text "$dButton1" \
-	    --button2text "$dButton2" \
-		--helpmessage "$dHelp" \
-		--helptitle "TITLE" \
-		--big \
-		--background "$dBackDir" \
-		--infobox "$dInfoBox" \
-		--moveable 
-	
-	)		
-		
+main() {
+  installSwiftDialog
 
+  echo "Verifying if macOS installer is already present…"
+  if [[ -d "/Applications/Install macOS ${dlmacOSName}.app" ]]; then
+    echo "Installer app found; prompting to install."
+    askToInstall
+  else
+    echo "Installer app not found; prompting user to download."
+    prompt_download
+  fi
+}
 
-	#Button pressed Stuff
-	returncode=$?
-
-
-	case ${returncode} in
-	    0)  echo "Pressed Button 1: download"
-		#code to download
-		
-		downloadmacOS & downloadmacOSAlert
-		
-		exit 0
-	        ;;
-
-	    2)  echo "Pressed Button 2: dismiss"
-	
-		exit 0
-
-	        ;;
-		
-	    *)  echo "Something else happened. exit code ${returncode}"
-		exit 0
-
-	        ;;
-	esac
+main "$@"
