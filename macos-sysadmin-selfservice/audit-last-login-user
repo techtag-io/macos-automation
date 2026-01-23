@@ -1,3 +1,68 @@
+#!/usr/bin/env bash
+#
+# Script Name: Track Last Logged-In User
+# Description:
+#   Records the last non-root console user in /Library/loginuser.txt
+#   and triggers Jamf user upload only when the user changes.
+#
+
+set -euo pipefail
+
+readonly LOG_FILE="/Library/loginuser.txt"
+
+get_console_user() {
+  stat -f '%Su' /dev/console
+}
+
+main() {
+  local last_user rec_login
+
+  last_user="$(get_console_user)"
+  echo "Initial console user: ${last_user}"
+
+  # Wait until console user is not root
+  while [[ "${last_user}" == "root" ]]; do
+    echo "Console user is root; waiting 5 seconds… (current: ${last_user})"
+    sleep 5
+    last_user="$(get_console_user)"
+  done
+
+  echo "${last_user} is not root, proceeding…"
+  echo "Checking for ${LOG_FILE}"
+
+  # If file does not exist, create it with current user and exit
+  if [[ ! -f "${LOG_FILE}" ]]; then
+    echo "File not found; creating with current user."
+    # Use tee with sudo to avoid issues with redirection as root
+    printf '%s\n' "${last_user}" | sudo tee "${LOG_FILE}" >/dev/null
+    echo "No prior user recorded; exiting."
+    exit 0
+  fi
+
+  # File exists: get last recorded user
+  rec_login="$(tail -n 1 "${LOG_FILE}")"
+  echo "Recorded last login user from file: ${rec_login}"
+
+  if [[ "${last_user}" == "${rec_login}" ]]; then
+    echo "Current user (${last_user}) matches recorded user (${rec_login}); nothing to do. Exiting."
+    exit 0
+  fi
+
+  # New user detected: append and run Jamf tasks
+  printf '%s\n' "${last_user}" | sudo tee -a "${LOG_FILE}" >/dev/null
+  echo "New user detected (${last_user} != ${rec_login}); running Jamf user upload."
+
+  sudo /usr/local/bin/jamf policy -event uploadUser
+  /usr/local/bin/jamf recon -room "Check User"
+
+  exit 0
+}
+
+main "$@"
+
+
+
+-------OG
 #!/bin/sh
 
 #Get last user from text file
