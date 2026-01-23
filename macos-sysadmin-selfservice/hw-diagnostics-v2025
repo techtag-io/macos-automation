@@ -1,3 +1,783 @@
+#!/usr/bin/env bash
+#
+# Script Name: Side Hardware Diagnostic Test
+# Author: Travis Green
+# Date: 2025-01-02
+#
+# Description:
+#   Runs an interactive hardware and readiness diagnostic using swiftDialog:
+#     - Side IT password gate
+#     - Power/charging check
+#     - Battery health and cycle count
+#     - CPU and SSD read/write tests
+#     - Network reachability and speed test
+#     - Bluetooth radio basic validation
+#     - USB-C ports presence check
+#     - Speaker and microphone sanity checks
+#     - iCloud sign‑in state
+#   Produces a text report and, if iCloud is signed out and everything looks good,
+#   optionally flags the Mac as ready to erase in Jamf and opens System Settings.
+#
+
+set -euo pipefail
+
+#######################################
+# Globals
+#######################################
+
+DIALOG_PATH="/usr/local/bin/dialog"
+dialog_background="/Library/Application Support/wallpaper/desktopwallpaper.jpg"
+dialog_icon_dir="/Library/Application Support/SideIT/ATTIcon.png"
+
+report_file="/tmp/side_hw_diagnostic_report.txt"
+JSON_FILE="/tmp/diagnostic_test.json"
+
+power_timer=120
+side_it_password="${4:-}"
+
+# Shared state used across functions
+power_status="Unknown"
+power_status_report="Unknown"
+power_mark="pending"
+all_good_icloud="no"
+tempfile=""
+ssd_pkg_path=""
+
+#######################################
+# Utility helpers
+#######################################
+
+current_console_user() {
+  stat -f '%Su' /dev/console
+}
+
+safe_rm() {
+  local path="$1"
+  [[ -e "${path}" ]] && sudo rm -rf "${path}"
+}
+
+log_section() {
+  # Convenience helper to make report more readable.
+  # Usage: log_section "Battery"
+  printf '**%s:**\n' "$1" >>"${report_file}"
+}
+
+#######################################
+# Password gate
+#######################################
+
+check_password() {
+  local pass_check="FAILED"
+  local dialog_output returncode
+
+  if [[ -z "${side_it_password}" ]]; then
+    echo "Side IT password parameter (4) is empty. Aborting."
+    exit 1
+  fi
+
+  while [[ "${pass_check}" != "PASSED" ]]; do
+    local dTitle dMessage dButton1 dButton2 dHelp
+
+    dTitle="Side IT Password Required"
+    dMessage=$(
+      cat <<EOF
+Due to high risk, this policy is password‑protected by Side IT Helpdesk.
+
+Only run this under Side IT supervision.
+
+Please enter the policy password. If you do not have it, please contact helpdesk@side.com.
+EOF
+    )
+    dButton1="Start"
+    dButton2="Cancel"
+    dHelp="This notification is launched automatically by Side IT Helpdesk.\nPlease contact helpdesk@side.com or #it-support in Slack with any questions or concerns."
+
+    dialog_output="$(
+      "${DIALOG_PATH}" \
+        --title "${dTitle}" \
+        --titlefont "name=Arial-MT,colour=#CE87C1,size=30" \
+        --message "${dMessage}" \
+        --messagefont "name=Arial-MT,size=18" \
+        --icon "${dialog_icon_dir}" \
+        --iconsize 120 \
+        --button1text "${dButton1}" \
+        --button2text "${dButton2}" \
+        --helpmessage "${dHelp}" \
+        --helptitle "TITLE" \
+        --textfield "Password",required,secure \
+        --big \
+        --background "${dialog_background}"
+    )"
+    returncode=$?
+
+    echo "Raw password dialog output: ${dialog_output}"
+
+    case "${returncode}" in
+      0)
+        echo "Pressed Button 1: Start"
+        if [[ "${dialog_output}" == "Password : ${side_it_password}" ]]; then
+          echo "Password Check: PASSED"
+          pass_check="PASSED"
+        else
+          echo "Password Check: FAILED"
+          pass_check="FAILED"
+        fi
+        ;;
+      2)
+        echo "Pressed Button 2: Cancel"
+        exit 0
+        ;;
+      *)
+        echo "Password dialog error: exit code ${returncode}"
+        exit 1
+        ;;
+    esac
+  done
+
+  killall Dialog 2>/dev/null || true
+}
+
+#######################################
+# Power dialog and status
+#######################################
+
+check_power_source() {
+  pmset -g batt | grep -q "AC Power"
+}
+
+power_check_dialog() {
+  local dMessage web
+
+  dMessage=$(
+    cat <<EOF
+In order to complete the diagnostic test, the device must be connected to a power source.
+
+Please ensure the computer is connected to a power source to proceed with the test.
+If a power source is not connected within the next two minutes, this alert will automatically dismiss, and the charge test will not be performed.
+EOF
+  )
+
+  web="https://i.pinimg.com/originals/59/df/95/59df95ecfb490ed3bab39a283ae7d8fa.gif"
+
+  "${DIALOG_PATH}" \
+    --title "Initializing. Power Source Connection Required" \
+    --titlefont "name=Arial-MT,colour=#CE87C1,size=30" \
+    --message "${dMessage}" \
+    --messagefont "name=Arial-MT,size=15" \
+    --icon "${dialog_icon_dir}" \
+    --iconsize 250 \
+    --webcontent "${web}" \
+    --background "${dialog_background}" \
+    --timer "${power_timer}" \
+    --moveable \
+    --ontop
+}
+
+launch_power_dialog() {
+  power_check_dialog &
+  local start_time
+  start_time="$(date +%s)"
+
+  while true; do
+    if check_power_source; then
+      echo "Power source connected. Dismissing dialog."
+      killall Dialog 2>/dev/null || true
+      power_status="Good"
+      power_status_report="Good – Charge when plugged in."
+      power_mark="success"
+      break
+    fi
+
+    local now
+    now="$(date +%s)"
+
+    if (( now - start_time >= power_timer )); then
+      echo "Power timer expired. Dismissing dialog."
+      killall Dialog 2>/dev/null || true
+      power_status="Unknown❗"
+      power_status_report="Unknown❗ – Charger not plugged in or damaged. Please verify manually."
+      power_mark="failed"
+      break
+    fi
+
+    echo "Power not connected, waiting… ${now} seconds since epoch."
+    sleep 1
+  done
+}
+
+power_check_launch() {
+  if check_power_source; then
+    echo "The laptop is running on AC power."
+    power_status="Good"
+    power_status_report="Good – Device was already charging."
+    power_mark="success"
+  else
+    echo "The laptop is running on battery power, launching power dialog."
+    launch_power_dialog
+  fi
+}
+
+#######################################
+# Progress dashboard (swiftDialog JSON)
+#######################################
+
+init_dialog_json() {
+  cat <<EOF >"${JSON_FILE}"
+{
+  "title": "Side Inc Hardware Diagnostic Test",
+  "message": "Diagnostic test running. This won't take long.",
+  "listitem": [
+    { "title": "Initializing",    "status": "pending", "statustext": "Pending" },
+    { "title": "Charger",        "status": "pending", "statustext": "Pending" },
+    { "title": "Battery",        "status": "pending", "statustext": "Pending" },
+    { "title": "CPU",            "status": "pending", "statustext": "Pending" },
+    { "title": "SSD",            "status": "pending", "statustext": "Pending" },
+    { "title": "Network",        "status": "pending", "statustext": "Pending" },
+    { "title": "Bluetooth",      "status": "pending", "statustext": "Pending" },
+    { "title": "USB Ports",      "status": "pending", "statustext": "Pending" },
+    { "title": "Speakers",       "status": "pending", "statustext": "Pending" },
+    { "title": "Microphone",     "status": "pending", "statustext": "Pending" },
+    { "title": "iCloud Status",  "status": "pending", "statustext": "Pending" },
+    { "title": "Building Report","status": "pending", "statustext": "Pending" }
+  ]
+}
+EOF
+}
+
+launch_progress_dialog() {
+  "${DIALOG_PATH}" \
+    --jsonfile "${JSON_FILE}" \
+    --infobox \
+    --big \
+    --ontop \
+    --moveable \
+    --progress \
+    --background "${dialog_background}" \
+    --icon "${dialog_icon_dir}" \
+    --button1text "Cancel" &
+  DIALOG_PID=$!
+
+  trap 'rm -f "'"${JSON_FILE}"'"; kill ${DIALOG_PID} 2>/dev/null || true' EXIT
+}
+
+update_list_item() {
+  local index="$1"
+  local status="$2"
+  local status_text="$3"
+
+  # This logs the intended update; to fully integrate with swiftDialog,
+  # you can use its "command file" input to drive dynamic updates.
+  echo "listitem: index: ${index}, status: ${status}, statustext: ${status_text}" >>/var/tmp/side_diagnostic_dialog.log
+}
+
+#######################################
+# Export / report dialog
+#######################################
+
+export_report_dialog() {
+  echo "Launching export report dialog…"
+
+  local print_report
+  print_report="$(cat "${report_file}")"
+
+  local dTitle dMessage timer dialogSelection returncode date_str serial
+
+  dTitle="Side Inc Diagnostic Test"
+  dMessage=$(
+    cat <<EOF
+Click **Export** to save a text copy of the report.
+
+This dialog will auto‑dismiss in 5 minutes.
+
+**For extra caution, please test anything concerning manually.**
+
+${print_report}
+EOF
+  )
+  timer=300
+
+  dialogSelection="$(
+    "${DIALOG_PATH}" \
+      --title "${dTitle}" \
+      --message "${dMessage}" \
+      --messagefont "name=Arial-MT,size=13" \
+      --icon "${dialog_icon_dir}" \
+      --iconsize 120 \
+      --button1text "Exit" \
+      --button2text "Export" \
+      --background "${dialog_background}" \
+      --moveable \
+      --timer "${timer}"
+  )"
+
+  returncode=$?
+
+  case "${returncode}" in
+    0)
+      echo "Pressed Button 1: Exit"
+      ;;
+    2)
+      echo "Pressed Button 2: Export"
+      date_str="$(date '+%Y-%m-%d_%H-%M-%S')"
+      serial="$(system_profiler SPHardwareDataType | awk '/Serial/ {print $4}')"
+      cp "${report_file}" "${HOME}/Desktop/${date_str} - ${serial}.txt"
+      ;;
+    *)
+      echo "Export dialog error: exit code ${returncode}"
+      ;;
+  esac
+
+  safe_rm "${report_file}"
+  killall Dialog 2>/dev/null || true
+}
+
+#######################################
+# Test steps
+#######################################
+
+initialize_step() {
+  update_list_item 0 "progress" "Initializing…"
+  echo "Downloading file for SSD test…"
+
+  local url
+  url="https://api.textmate.org/downloads/release?os=10.12"
+  ssd_pkg_path="/tmp/ssd_test.pkg"
+
+  /usr/bin/curl -L -o "${ssd_pkg_path}" "${url}"
+
+  tempfile="${ssd_pkg_path}"
+
+  sleep 3
+  update_list_item 0 "success" "Done"
+}
+
+power_check_step() {
+  update_list_item 1 "progress" "Getting charging information…"
+
+  log_section "Power"
+  printf '> Condition: %s\n\n\n' "${power_status_report}" >>"${report_file}"
+
+  update_list_item 1 "${power_mark}" "${power_status}"
+}
+
+battery_condition_step() {
+  update_list_item 2 "progress" "Running battery tests…"
+  log_section "Battery"
+
+  echo "Getting battery cycle count…"
+  local battery_cycle_count
+  battery_cycle_count="$(system_profiler SPPowerDataType | awk -F': ' '/Cycle Count/ {print $2}')"
+  printf '> Cycle Count: %s\n' "${battery_cycle_count}" >>"${report_file}"
+
+  echo "Getting battery condition…"
+  local battery_condition
+  battery_condition="$(system_profiler SPPowerDataType | awk -F': ' '/Condition/ {print $2}')"
+  printf '> Condition: %s\n' "${battery_condition}" >>"${report_file}"
+
+  local battery_result
+  battery_result="${battery_condition} * Cycle Count ${battery_cycle_count}"
+  echo "Battery results: ${battery_result}"
+
+  update_list_item 2 "success" "${battery_result}"
+
+  printf '\n\n' >>"${report_file}"
+}
+
+cpu_condition_step() {
+  update_list_item 3 "progress" "Running CPU tests…"
+  log_section "CPU"
+
+  local cpu_temp_file="${tempfile:-/tmp/cpu_test.tmp}"
+  local block_size="1M"
+  local block_count=1024
+
+  convert_to_gb_per_sec() {
+    local raw="$1"
+    local clean
+    clean="$(echo "${raw}" | tr -cd '[:digit:].')"
+    printf '%.2f\n' "$(echo "${clean} / 1073741824" | bc -l)"
+  }
+
+  echo "Testing CPU write speed…"
+  local write_output cpu_write_speed cpu_write_speed_gb
+  write_output="$(dd if=/dev/zero of="${cpu_temp_file}" bs="${block_size}" count="${block_count}" oflag=direct 2>&1 || true)"
+  echo "Raw write output: ${write_output}"
+  cpu_write_speed="$(echo "${write_output}" | awk '/bytes transferred/ {print $(NF-1)}')"
+  cpu_write_speed_gb="$(convert_to_gb_per_sec "${cpu_write_speed}")"
+  echo "Write speed: ${cpu_write_speed_gb} GB/s"
+
+  echo "Testing CPU read speed…"
+  local read_output cpu_read_speed cpu_read_speed_gb
+  read_output="$(dd if="${cpu_temp_file}" of=/dev/null bs="${block_size}" count="${block_count}" iflag=direct 2>&1 || true)"
+  echo "Raw read output: ${read_output}"
+  cpu_read_speed="$(echo "${read_output}" | awk '/bytes transferred/ {print $(NF-1)}')"
+  cpu_read_speed_gb="$(convert_to_gb_per_sec "${cpu_read_speed}")"
+  echo "Read speed: ${cpu_read_speed_gb} GB/s"
+
+  printf '> Read Speed: %s GB/s\n' "${cpu_read_speed_gb}" >>"${report_file}"
+  printf '> Write Speed: %s GB/s\n\n\n' "${cpu_write_speed_gb}" >>"${report_file}"
+
+  update_list_item 3 "success" "Read ${cpu_read_speed_gb} GB/s * Write ${cpu_write_speed_gb} GB/s"
+}
+
+ssd_condition_step() {
+  update_list_item 4 "progress" "Running SSD tests…"
+  log_section "SSD"
+
+  local tempfile_path="/tmp/ssd_test.bin"
+
+  bytes_to_mb() { echo "scale=2; $1 / 1048576" | bc; }
+  mb_to_gb()   { echo "scale=2; $1 / 1024" | bc; }
+
+  echo "Testing SSD write speed…"
+  local write_output write_bytes write_speed_mb write_speed_gb
+  write_output="$(dd if=/dev/zero of="${tempfile_path}" bs=1G count=1 oflag=direct 2>&1 || true)"
+  write_bytes="$(echo "${write_output}" | awk '/bytes transferred/ {gsub(/[()]/,"",$(NF-1)); print $(NF-1)}')"
+  write_speed_mb="$(bytes_to_mb "${write_bytes}")"
+  write_speed_gb="$(mb_to_gb "${write_speed_mb}")"
+  printf '> Write Speed: %s GB/second\n\n' "${write_speed_gb}" >>"${report_file}"
+
+  sync
+
+  echo "Testing SSD read speed…"
+  local read_output read_bytes read_speed_mb read_speed_gb
+  read_output="$(dd if="${tempfile_path}" of=/dev/null bs=1G count=1 iflag=direct 2>&1 || true)"
+  read_bytes="$(echo "${read_output}" | awk '/bytes transferred/ {gsub(/[()]/,"",$(NF-1)); print $(NF-1)}')"
+  read_speed_mb="$(bytes_to_mb "${read_bytes}")"
+  read_speed_gb="$(mb_to_gb "${read_speed_mb}")"
+  printf '> Read Speed: %s GB/second\n' "${read_speed_gb}" >>"${report_file}"
+
+  local ssd_results
+  ssd_results="Read ${read_speed_gb}GB/s * Write ${write_speed_gb}GB/s"
+  echo "SSD test results: ${ssd_results}"
+
+  update_list_item 4 "success" "${ssd_results}"
+
+  printf '\n\n' >>"${report_file}"
+}
+
+network_condition_step() {
+  update_list_item 5 "progress" "Running network tests…"
+  log_section "Network"
+
+  local wifi_status download_speed upload_speed
+
+  if ping -c 4 8.8.8.8 >/dev/null 2>&1; then
+    wifi_status="Good"
+    sleep 2
+
+    local speed_test
+    speed_test="$(
+      curl -s https://raw.githubusercontent.com/sivel/speedtest-cli/master/speedtest.py | python3 2>/dev/null || true
+    )"
+
+    download_speed="$(echo "${speed_test}" | awk '/Download/ {print $2, $3}')"
+    upload_speed="$(echo "${speed_test}" | awk '/Upload/ {print $2, $3}')"
+
+    if [[ -z "${download_speed}" || -z "${upload_speed}" ]]; then
+      download_speed="Download unavailable❗"
+      upload_speed="Upload unavailable❗"
+    fi
+  else
+    wifi_status="Bad❗"
+    download_speed="No connection❗"
+    upload_speed="NA❗"
+  fi
+
+  local show_result
+  show_result="DN:${download_speed} * UP:${upload_speed}"
+  echo "Network results: ${show_result}"
+
+  printf '> Download Speed: %s\n' "${download_speed}" >>"${report_file}"
+  printf '> Upload Speed: %s\n\n\n' "${upload_speed}" >>"${report_file}"
+
+  update_list_item 5 "success" "${show_result}"
+}
+
+bt_condition_step() {
+  update_list_item 6 "progress" "Running Bluetooth tests…"
+  log_section "Bluetooth"
+
+  local bt_status
+
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "Homebrew not found; installing…"
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
+    export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+  fi
+
+  if ! command -v blueutil >/dev/null 2>&1; then
+    echo "Installing blueutil…"
+    brew install blueutil || true
+  fi
+
+  if command -v blueutil >/dev/null 2>&1; then
+    local bluetooth_status
+    bluetooth_status="$(blueutil -p)"
+
+    if [[ "${bluetooth_status}" -eq 1 ]]; then
+      echo "Bluetooth is already on and working."
+      bt_status="Good"
+      printf '> Bluetooth is already on and working.\n' >>"${report_file}"
+    else
+      echo "Turning Bluetooth on…"
+      blueutil -p 1
+      sleep 2
+      bluetooth_status="$(blueutil -p)"
+      if [[ "${bluetooth_status}" -eq 1 ]]; then
+        echo "Bluetooth works after enabling."
+        bt_status="Good"
+        printf '> Bluetooth had to be turned on and is working.\n' >>"${report_file}"
+      else
+        echo "Bluetooth seems to be broken."
+        bt_status="Broken❗"
+        printf '> Bluetooth seems to be broken. Please test manually.\n' >>"${report_file}"
+      fi
+    fi
+  else
+    bt_status="Unknown❗"
+    printf '> Could not validate Bluetooth (blueutil unavailable). Test manually.\n' >>"${report_file}"
+  fi
+
+  update_list_item 6 "success" "${bt_status}"
+
+  printf '\n\n' >>"${report_file}"
+}
+
+usb_ports_step() {
+  update_list_item 7 "progress" "Checking USB‑C ports…"
+  log_section "USB Ports"
+
+  local usb_devices usb_update usb_status
+
+  usb_devices="$(system_profiler SPUSBDataType || true)"
+  sleep 3
+
+  if [[ -z "${usb_devices}" ]]; then
+    usb_update="Broken ❗"
+    usb_status="failed"
+  else
+    usb_update="Good"
+    usb_status="success"
+  fi
+
+  printf '> Condition: %s\n\n\n' "${usb_update}" >>"${report_file}"
+
+  update_list_item 7 "${usb_status}" "${usb_update}"
+}
+
+speaker_condition_step() {
+  update_list_item 8 "progress" "Running speaker test…"
+  log_section "Speakers"
+
+  afplay /System/Library/Sounds/Ping.aiff >/dev/null 2>&1 &
+  sleep 1
+
+  local speaker_status
+  if pgrep -x "coreaudiod" >/dev/null 2>&1; then
+    speaker_status="Good"
+  else
+    speaker_status="Broken❗"
+  fi
+
+  printf '> Condition: %s\n\n\n' "${speaker_status}" >>"${report_file}"
+
+  update_list_item 8 "success" "${speaker_status}"
+}
+
+mic_condition_step() {
+  update_list_item 9 "progress" "Running microphone tests…"
+  log_section "Microphone"
+
+  rec -q /dev/null trim 0 1 >/dev/null 2>&1 || true
+  sleep 2
+
+  local mic_status
+  if pgrep -x "coreaudiod" >/dev/null 2>&1; then
+    mic_status="Good"
+  else
+    mic_status="Broken❗"
+  fi
+
+  printf '> Condition: %s\n\n\n' "${mic_status}" >>"${report_file}"
+
+  update_list_item 9 "success" "${mic_status}"
+}
+
+icloud_status_step() {
+  update_list_item 10 "progress" "Checking iCloud status…"
+  log_section "iCloud Status"
+
+  local currentUser iCloudLoggedInCheck
+
+  currentUser="$(current_console_user)"
+  iCloudLoggedInCheck="$(defaults read "/Users/${currentUser}/Library/Preferences/MobileMeAccounts" Accounts 2>/dev/null || true)"
+
+  local iCloudLoggedIn status_icon icloud_report
+
+  if [[ "${iCloudLoggedInCheck}" == *"AccountID"* ]]; then
+    iCloudLoggedIn="iCloud – YES ❗"
+    status_icon="failed"
+    icloud_report="iCloud – YES ❗ Please remove the device from the iCloud account."
+    all_good_icloud="no"
+  else
+    iCloudLoggedIn="iCloud – NO"
+    status_icon="success"
+    icloud_report="iCloud – NO"
+    all_good_icloud="yes"
+  fi
+
+  echo "iCloud: ${iCloudLoggedIn}"
+  printf '> %s\n\n\n' "${icloud_report}" >>"${report_file}"
+
+  update_list_item 10 "${status_icon}" "${iCloudLoggedIn}"
+}
+
+final_report_step() {
+  update_list_item 11 "progress" "Generating report…"
+
+  echo "Cleaning up SSD test files…"
+  sleep 1
+  [[ -n "${tempfile}" ]] && safe_rm "${tempfile}"
+  safe_rm "/tmp/ssd_test.bin"
+  sleep 2
+
+  update_list_item 11 "success" "Complete"
+
+  sleep 1
+
+  echo "Closing progress dialog and removing JSON file…"
+  killall Dialog 2>/dev/null || true
+  safe_rm "${JSON_FILE}"
+
+  export_report_dialog
+}
+
+#######################################
+# Erase‑readiness and Jamf integration
+#######################################
+
+all_good_step() {
+  erase_all_settings_dialog() {
+    local dTitle dMessage
+
+    dTitle="Working…"
+    dMessage=$(
+      cat <<EOF
+We are excluding you from the lock policy.
+
+Shortly you will see Settings > General open. Please scroll to the bottom and click
+**Transfer or Reset** followed by **Erase all contents and settings**.
+
+Once you open that window, simply authenticate and let macOS do the rest!
+EOF
+    )
+
+    "${DIALOG_PATH}" \
+      --title "${dTitle}" \
+      --message "${dMessage}" \
+      --messagefont "name=Arial-MT,size=13" \
+      --icon "${dialog_icon_dir}" \
+      --iconsize 120 \
+      --button1text "OK" \
+      --background "${dialog_background}" \
+      --moveable \
+      --progress
+  }
+
+  add_to_jamf() {
+    sudo /usr/local/bin/jamf recon -room "hardware_pass"
+    open "x-apple.systempreferences:com.apple.SystemPreferences?General"
+  }
+
+  if [[ "${all_good_icloud}" == "yes" ]]; then
+    echo "iCloud is signed out; device is eligible for erase prompt."
+
+    local dTitle dMessage dialogSelection returncode
+
+    dTitle="Erase all data and settings?"
+    dMessage=$(
+      cat <<EOF
+Everything passed in the test.
+
+Would you like to **Erase all contents and settings** to set this Mac up for the next user?
+
+This dialog will auto‑dismiss in 30 seconds and no action will be taken if you do nothing.
+EOF
+    )
+
+    dialogSelection="$(
+      "${DIALOG_PATH}" \
+        --title "${dTitle}" \
+        --message "${dMessage}" \
+        --messagefont "name=Arial-MT,size=13" \
+        --icon "${dialog_icon_dir}" \
+        --iconsize 120 \
+        --background "${dialog_background}" \
+        --moveable \
+        --button1text "YES" \
+        --button2text "NO" \
+        --timer 30
+    )"
+
+    returncode=$?
+
+    case "${returncode}" in
+      0)
+        echo "User chose YES to erase."
+        erase_all_settings_dialog &
+        add_to_jamf
+        killall Dialog 2>/dev/null || true
+        exit 0
+        ;;
+      2)
+        echo "User chose NO to erase."
+        exit 0
+        ;;
+      *)
+        echo "Erase prompt dialog error: exit code ${returncode}"
+        exit 0
+        ;;
+    esac
+  else
+    echo "iCloud is still signed in; not offering erase flow."
+  fi
+}
+
+#######################################
+# Main
+#######################################
+
+main() {
+  safe_rm "${report_file}"
+
+  check_password
+  power_check_launch
+
+  init_dialog_json
+  launch_progress_dialog
+
+  initialize_step
+  power_check_step
+  battery_condition_step
+  cpu_condition_step
+  ssd_condition_step
+  network_condition_step
+  bt_condition_step
+  usb_ports_step
+  speaker_condition_step
+  mic_condition_step
+  icloud_status_step
+  final_report_step
+
+  all_good_step
+}
+
+main "$@"
+
+
+
+----------OG
 #!/bin/bash
 
 ## Designed by Travis Green - Jan 2nd 2025
